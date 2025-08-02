@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+from groq import Groq
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, HttpUrl
@@ -35,7 +36,7 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-openai_client = openai.OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
+groq_client = Groq(api_key=os.environ.get("API_KEY") ,)
 
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -206,8 +207,8 @@ Instructions:
 - Use specific details from the document when available"""
 
         response = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model="gpt-4o-mini",
+            groq_client.chat.completions.create,
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that answers questions based on document content. Always provide accurate, direct answers based on the provided context."},
                 {"role": "user", "content": prompt}
