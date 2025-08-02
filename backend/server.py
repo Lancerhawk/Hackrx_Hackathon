@@ -180,7 +180,7 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[st
     return chunks
 
 async def generate_answer(question: str, relevant_chunks: List[DocumentChunk]) -> str:
-    """Generate answer using OpenAI GPT-4o-mini"""
+    """Generate answer using llama-3.1-8b-instant"""
     try:
         context = "\n\n".join([chunk.text for chunk in relevant_chunks])
         
