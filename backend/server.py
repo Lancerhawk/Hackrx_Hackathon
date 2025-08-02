@@ -187,7 +187,7 @@ async def generate_answer(question: str, relevant_chunks: List[DocumentChunk]) -
         encoding = tiktoken.get_encoding("cl100k_base") 
         context_tokens = encoding.encode(context)
         
-        max_context_tokens = 12000  
+        max_context_tokens = 131072 
         if len(context_tokens) > max_context_tokens:
             context_tokens = context_tokens[:max_context_tokens]
             context = encoding.decode(context_tokens)
