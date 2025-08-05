@@ -36,3 +36,4 @@ groq
 einops
 pynvml
 nvidia-ml-py
+psutil

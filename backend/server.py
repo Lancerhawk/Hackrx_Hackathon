@@ -29,6 +29,9 @@ import time
 import math
 from typing import Generator, Iterator
 import psutil
+import hashlib
+import json
+import pickle
 
 class RequestQueue:
     """Manages request queue for sequential processing"""
@@ -436,6 +439,168 @@ class HybridMemoryManager:
 
 memory_manager = HybridMemoryManager()
 
+class DocumentChunk:
+    def __init__(self, text: str, metadata: Dict[str, Any] = None):
+        self.text = text
+        self.metadata = metadata or {}
+
+class DocumentCacheManager:
+    """Manages caching of chunked documents to avoid reprocessing"""
+    
+    def __init__(self, cache_dir: str = "files"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"Document cache initialized at: {self.cache_dir.absolute()}")
+    
+    def _get_document_hash(self, url: str) -> str:
+        """Generate a hash for the document URL"""
+        return hashlib.md5(url.encode()).hexdigest()
+    
+    def _get_cache_path(self, url: str) -> Path:
+        """Get the cache file path for a document URL"""
+        doc_hash = self._get_document_hash(url)
+        return self.cache_dir / f"{doc_hash}.pkl"
+    
+    def _get_metadata_path(self, url: str) -> Path:
+        """Get the metadata file path for a document URL"""
+        doc_hash = self._get_document_hash(url)
+        return self.cache_dir / f"{doc_hash}_metadata.json"
+    
+    def is_cached(self, url: str) -> bool:
+        """Check if a document is already cached"""
+        cache_path = self._get_cache_path(url)
+        metadata_path = self._get_metadata_path(url)
+        return cache_path.exists() and metadata_path.exists()
+    
+    def save_chunks(self, url: str, chunks: List[DocumentChunk], model_type: str, file_size: int):
+        """Save chunked document to cache"""
+        try:
+            cache_path = self._get_cache_path(url)
+            metadata_path = self._get_metadata_path(url)
+            
+            # Save chunks
+            chunk_data = {
+                'chunks': [{'text': chunk.text, 'metadata': chunk.metadata} for chunk in chunks],
+                'model_type': model_type,
+                'file_size': file_size,
+                'cached_at': datetime.utcnow().isoformat()
+            }
+            
+            with open(cache_path, 'wb') as f:
+                pickle.dump(chunk_data, f)
+            
+            # Save metadata
+            metadata = {
+                'url': url,
+                'model_type': model_type,
+                'file_size': file_size,
+                'chunk_count': len(chunks),
+                'cached_at': datetime.utcnow().isoformat(),
+                'hash': self._get_document_hash(url)
+            }
+            
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            self.logger.info(f"Cached {len(chunks)} chunks for document: {url}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save chunks to cache: {e}")
+            return False
+    
+    def load_chunks(self, url: str) -> Tuple[List[DocumentChunk], str, int]:
+        """Load chunked document from cache"""
+        try:
+            cache_path = self._get_cache_path(url)
+            metadata_path = self._get_metadata_path(url)
+            
+            if not cache_path.exists() or not metadata_path.exists():
+                raise FileNotFoundError("Cache files not found")
+            
+            # Load chunks
+            with open(cache_path, 'rb') as f:
+                chunk_data = pickle.load(f)
+            
+            # Reconstruct DocumentChunk objects
+            chunks = []
+            for chunk_info in chunk_data['chunks']:
+                chunk = DocumentChunk(
+                    text=chunk_info['text'],
+                    metadata=chunk_info.get('metadata', {})
+                )
+                chunks.append(chunk)
+            
+            self.logger.info(f"Loaded {len(chunks)} chunks from cache for document: {url}")
+            return chunks, chunk_data['model_type'], chunk_data['file_size']
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load chunks from cache: {e}")
+            raise e
+    
+    def get_cache_info(self, url: str) -> Optional[Dict]:
+        """Get cache information for a document"""
+        try:
+            metadata_path = self._get_metadata_path(url)
+            if not metadata_path.exists():
+                return None
+            
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            
+            return metadata
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get cache info: {e}")
+            return None
+    
+    def clear_cache(self, url: str = None):
+        """Clear cache for specific URL or all cache"""
+        try:
+            if url:
+                cache_path = self._get_cache_path(url)
+                metadata_path = self._get_metadata_path(url)
+                
+                if cache_path.exists():
+                    cache_path.unlink()
+                if metadata_path.exists():
+                    metadata_path.unlink()
+                
+                self.logger.info(f"Cleared cache for: {url}")
+            else:
+                # Clear all cache
+                for file_path in self.cache_dir.glob("*.pkl"):
+                    file_path.unlink()
+                for file_path in self.cache_dir.glob("*_metadata.json"):
+                    file_path.unlink()
+                
+                self.logger.info("Cleared all document cache")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to clear cache: {e}")
+    
+    def get_cache_stats(self) -> Dict:
+        """Get cache statistics"""
+        try:
+            cache_files = list(self.cache_dir.glob("*.pkl"))
+            metadata_files = list(self.cache_dir.glob("*_metadata.json"))
+            
+            total_size = sum(f.stat().st_size for f in cache_files)
+            
+            return {
+                "cache_dir": str(self.cache_dir.absolute()),
+                "cached_documents": len(cache_files),
+                "total_cache_size_bytes": total_size,
+                "total_cache_size_mb": total_size / (1024 * 1024)
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get cache stats: {e}")
+            return {}
+
+document_cache_manager = DocumentCacheManager()
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -480,11 +645,6 @@ class HackRXRequest(BaseModel):
 
 class HackRXResponse(BaseModel):
     answers: List[str]
-
-class DocumentChunk:
-    def __init__(self, text: str, metadata: Dict[str, Any] = None):
-        self.text = text
-        self.metadata = metadata or {}
 
 class SemanticSearchEngine:
     def __init__(self, model_type: str = 'heavy'):
@@ -1095,11 +1255,136 @@ async def get_memory_status():
         logger.error(f"Error getting memory status: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get memory status: {str(e)}")
 
+@api_router.get("/cache/stats")
+async def get_cache_stats():
+    """Get document cache statistics"""
+    try:
+        cache_stats = document_cache_manager.get_cache_stats()
+        return {
+            "cache_stats": cache_stats,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error getting cache stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get cache stats: {str(e)}")
+
+@api_router.get("/cache/info/{url:path}")
+async def get_cache_info(url: str):
+    """Get cache information for a specific document URL"""
+    try:
+        # Decode URL if it's encoded
+        import urllib.parse
+        decoded_url = urllib.parse.unquote(url)
+        
+        cache_info = document_cache_manager.get_cache_info(decoded_url)
+        if cache_info is None:
+            raise HTTPException(status_code=404, detail="Document not found in cache")
+        
+        return {
+            "cache_info": cache_info,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting cache info: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get cache info: {str(e)}")
+
+@api_router.delete("/cache/clear")
+async def clear_cache(url: str = None):
+    """Clear document cache - specific URL or all cache"""
+    try:
+        if url:
+            import urllib.parse
+            decoded_url = urllib.parse.unquote(url)
+            document_cache_manager.clear_cache(decoded_url)
+            message = f"Cache cleared for: {decoded_url}"
+        else:
+            document_cache_manager.clear_cache()
+            message = "All document cache cleared"
+        
+        return {
+            "message": message,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error clearing cache: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear cache: {str(e)}")
+
+@api_router.get("/cache/list")
+async def list_cached_documents():
+    """List all cached documents"""
+    try:
+        cache_dir = document_cache_manager.cache_dir
+        cached_docs = []
+        
+        for metadata_file in cache_dir.glob("*_metadata.json"):
+            try:
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                    cached_docs.append(metadata)
+            except Exception as e:
+                logger.warning(f"Failed to read metadata file {metadata_file}: {e}")
+                continue
+        
+        return {
+            "cached_documents": cached_docs,
+            "total_count": len(cached_docs),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error listing cached documents: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list cached documents: {str(e)}")
+
 async def process_hackrx_request(request: HackRXRequest):
-    """Internal function to process HackRX request"""
+    """Internal function to process HackRX request with caching"""
     logger.info(f"Processing request with document: {request.documents}")
     logger.info(f"Questions: {len(request.questions)}")
     
+    # Check if document is already cached
+    if document_cache_manager.is_cached(request.documents):
+        logger.info(f"Document found in cache: {request.documents}")
+        try:
+            # Load chunks from cache
+            chunks, model_type, file_size = document_cache_manager.load_chunks(request.documents)
+            logger.info(f"Loaded {len(chunks)} chunks from cache")
+            
+            # Create search engine with cached chunks
+            search_engine = SemanticSearchEngine(model_type=model_type)
+            search_engine.add_chunks(chunks)
+            
+            # Process questions
+            answers = []
+            for i, question in enumerate(request.questions):
+                logger.info(f"Processing question {i+1}/{len(request.questions)}: {question}")
+                
+                normalized_question = normalize_question(question)
+                answer = await generate_answer_with_retry(question, search_engine, start_k=5)
+                answers.append(answer)
+                logger.info(f"Generated answer: {answer[:100]}...")
+                
+                if i % 3 == 0:
+                    memory_manager.cleanup_memory()
+                    logger.info("Periodic memory cleanup performed")
+            
+            logger.info("All questions processed successfully from cache")
+            logger.info(f"Returning response with {len(answers)} answers")
+            
+            try:
+                final_response = HackRXResponse(answers=answers)
+                logger.info("Response object created successfully")
+                logger.info(f"Response content: {final_response.answers}")
+                return final_response
+            except Exception as response_error:
+                logger.error(f"Error creating response: {response_error}")
+                return HackRXResponse(answers=answers)
+                
+        except Exception as cache_error:
+            logger.error(f"Error loading from cache: {cache_error}")
+            logger.info("Falling back to normal processing")
+            # Continue with normal processing if cache loading fails
+    
+    # Normal processing path (not cached or cache failed)
     initial_stats = memory_manager.get_memory_stats()
     logger.info(f"Initial memory stats: {initial_stats}")
     
@@ -1156,6 +1441,7 @@ async def process_large_document_piece_by_piece(request: HackRXRequest, pdf_byte
         
         total_chunks = 0
         piece_count = 0
+        all_document_chunks = []  # Collect all chunks for caching
         
         for text_piece in extract_text_from_pdf_streaming(pdf_bytes, max_pages_per_chunk=5):
             piece_count += 1
@@ -1167,6 +1453,7 @@ async def process_large_document_piece_by_piece(request: HackRXRequest, pdf_byte
                 for chunk_piece in chunk_text_piece_by_piece(text_piece, chunk_size=200, overlap=30):
                     document_chunks = [DocumentChunk(text=chunk_text) for chunk_text in chunk_piece]
                     search_engine.add_chunks_piece_by_piece(document_chunks)
+                    all_document_chunks.extend(document_chunks)  # Collect for caching
                     total_chunks += len(chunk_piece)
                     
                     memory_manager.cleanup_memory()
@@ -1177,6 +1464,7 @@ async def process_large_document_piece_by_piece(request: HackRXRequest, pdf_byte
                 chunks_text = chunk_text(text_piece, chunk_size=300, overlap=50)
                 document_chunks = [DocumentChunk(text=chunk_text) for chunk_text in chunks_text]
                 search_engine.add_chunks_piece_by_piece(document_chunks)
+                all_document_chunks.extend(document_chunks)  # Collect for caching
                 total_chunks += len(chunks_text)
                 
                 memory_manager.cleanup_memory()
@@ -1185,6 +1473,15 @@ async def process_large_document_piece_by_piece(request: HackRXRequest, pdf_byte
                 logger.info(f"Added text piece with {len(chunks_text)} chunks. Total chunks: {total_chunks}")
         
         logger.info(f"Document processing completed. Total chunks: {total_chunks}")
+        
+        # Save all chunks to cache for future use
+        cache_success = document_cache_manager.save_chunks(
+            request.documents, all_document_chunks, model_type, file_size
+        )
+        if cache_success:
+            logger.info(f"Successfully cached {len(all_document_chunks)} chunks for future requests")
+        else:
+            logger.warning("Failed to cache chunks, but continuing with processing")
         
         answers = []
         for i, question in enumerate(request.questions):
@@ -1249,6 +1546,15 @@ async def process_document_standard(request: HackRXRequest, pdf_bytes: bytes, fi
         
         model_type = memory_manager.select_model_for_pdf_size(file_size)
         
+        # Save chunks to cache for future use
+        cache_success = document_cache_manager.save_chunks(
+            request.documents, document_chunks, model_type, file_size
+        )
+        if cache_success:
+            logger.info(f"Successfully cached {len(document_chunks)} chunks for future requests")
+        else:
+            logger.warning("Failed to cache chunks, but continuing with processing")
+        
         search_engine = SemanticSearchEngine(model_type=model_type)
         search_engine.add_chunks(document_chunks)
         
@@ -1293,10 +1599,46 @@ async def process_document_standard(request: HackRXRequest, pdf_bytes: bytes, fi
         raise e
 
 async def process_simple_request(request: HackRXRequest):
-    """Internal function to process simple HackRX request"""
+    """Internal function to process simple HackRX request with caching"""
     logger.info(f"Processing simple request with document: {request.documents}")
     logger.info(f"Questions: {len(request.questions)}")
     
+    # Check if document is already cached
+    if document_cache_manager.is_cached(request.documents):
+        logger.info(f"Document found in cache: {request.documents}")
+        try:
+            # Load chunks from cache
+            chunks, model_type, file_size = document_cache_manager.load_chunks(request.documents)
+            logger.info(f"Loaded {len(chunks)} chunks from cache")
+            
+            # Create search engine with cached chunks
+            search_engine = SemanticSearchEngine(model_type=model_type)
+            search_engine.add_chunks(chunks)
+            
+            # Process questions
+            answers = []
+            for i, question in enumerate(request.questions):
+                logger.info(f"Processing question {i+1}/{len(request.questions)}: {question}")
+                
+                normalized_question = normalize_question(question)
+                answer = await generate_answer_with_retry(question, search_engine, start_k=5)
+                answers.append(answer)
+                logger.info(f"Generated answer: {answer[:100]}...")
+                
+                if i < len(request.questions) - 1:
+                    logger.info("Waiting 5 seconds before processing next question...")
+                    await asyncio.sleep(5)
+            
+            logger.info("All questions processed successfully from cache")
+            logger.info(f"Returning response with {len(answers)} answers")
+            return HackRXResponse(answers=answers)
+            
+        except Exception as cache_error:
+            logger.error(f"Error loading from cache: {cache_error}")
+            logger.info("Falling back to normal processing")
+            # Continue with normal processing if cache loading fails
+    
+    # Normal processing path (not cached or cache failed)
     pdf_bytes = await download_pdf(request.documents)
     logger.info("PDF downloaded successfully")
     
@@ -1307,6 +1649,16 @@ async def process_simple_request(request: HackRXRequest):
     logger.info(f"Created {len(chunks_text)} chunks")
     
     document_chunks = [DocumentChunk(text=chunk_text) for chunk_text in chunks_text]
+    
+    # Save chunks to cache for future use
+    file_size = len(pdf_bytes)
+    cache_success = document_cache_manager.save_chunks(
+        request.documents, document_chunks, 'heavy', file_size
+    )
+    if cache_success:
+        logger.info(f"Successfully cached {len(document_chunks)} chunks for future requests")
+    else:
+        logger.warning("Failed to cache chunks, but continuing with processing")
     
     search_engine = SemanticSearchEngine(model_type='heavy')
     search_engine.add_chunks(document_chunks)
