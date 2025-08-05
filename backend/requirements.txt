@@ -34,3 +34,5 @@ aiohttp>=3.9.0
 huggingface-hub>=0.15.1
 groq
 einops
+pynvml
+nvidia-ml-py
