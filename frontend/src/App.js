@@ -141,7 +141,7 @@ Are there any sub-limits on room rent and ICU charges for Plan A?`);
           <div className="text-center mb-12">
             <div className="inline-flex items-center space-x-2 bg-gradient-to-r from-blue-500/10 to-purple-500/10 dark:from-blue-400/20 dark:to-purple-400/20 px-4 py-2 rounded-full mb-6">
               <Sparkles className="h-4 w-4 text-blue-600 dark:text-blue-400" />
-              <span className="text-sm font-medium text-blue-700 dark:text-blue-300">Powered by Advanced AI</span>
+              <span className="text-sm font-medium text-blue-700 dark:text-blue-300">Powered by Coding Era!</span>
             </div>
             <h2 className="text-4xl md:text-5xl font-bold text-slate-800 dark:text-white mb-4">
               Transform Your Documents into

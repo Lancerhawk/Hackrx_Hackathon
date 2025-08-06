@@ -93,9 +93,9 @@ class HybridMemoryManager:
         self.embedding_models = {}  
         self.logger = logging.getLogger(__name__)
         
-        self.max_chunk_size = 500  
-        self.max_batch_size = 32  
-        self.memory_safety_margin = 0.1 
+        self.max_chunk_size = 700  
+        self.max_batch_size = 64   
+        self.memory_safety_margin = 0.1
         
         self.small_pdf_threshold = 10 * 1024 * 1024 
         self.medium_pdf_threshold = 50 * 1024 * 1024 
@@ -120,6 +120,8 @@ class HybridMemoryManager:
                 'accuracy': 'good'
             }
         }
+        self.get_embedding_model('heavy')
+        self.get_embedding_model('medium')
         
     def get_gpu_memory_usage(self) -> float:
         """Get current GPU memory usage as a percentage"""
@@ -177,20 +179,17 @@ class HybridMemoryManager:
         return self.embedding_models[model_type]
     
     def clear_model_cache(self):
-        """Clear all model caches to free memory"""
-        self.logger.info("Clearing model cache")
+        """Clear all model caches to free memory (should only be called if memory is critically low)"""
+        self.logger.info("Clearing model cache (should only be done if memory is critically low)")
         for model_type, model in self.embedding_models.items():
             try:
                 del model
                 self.logger.info(f"Cleared {model_type} model")
             except Exception as e:
                 self.logger.warning(f"Failed to clear {model_type} model: {e}")
-        
         self.embedding_models.clear()
-        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
         gc.collect()
     
     def should_offload_to_cpu(self) -> bool:
@@ -232,59 +231,149 @@ class HybridMemoryManager:
         self.logger.info(f"Offloaded {len(oldest_keys)} embeddings. GPU cache: {len(self.gpu_cache)}, CPU cache: {len(self.cpu_cache)}")
     
     def encode_texts_hybrid(self, texts: List[str], chunk_ids: List[str] = None, model_type: str = 'heavy') -> np.ndarray:
-        """Encode texts using hybrid GPU/CPU approach with dynamic model selection"""
+        """Encode texts using hybrid GPU/CPU approach with aggressive GPU memory recovery"""
         if chunk_ids is None:
             chunk_ids = [str(i) for i in range(len(texts))]
-        
-        model = self.get_embedding_model(model_type)
-        results = []
         
         if self.should_use_cpu_only():
             self.logger.warning("GPU memory critical, using CPU only for encoding")
             try:
+                model = self.get_embedding_model(model_type)
                 embeddings = model.encode(texts, convert_to_tensor=False, device='cpu')
                 for i, chunk_id in enumerate(chunk_ids):
                     self.cpu_cache[chunk_id] = embeddings[i]
                 return embeddings
             except Exception as e:
                 self.logger.error(f"CPU encoding failed: {e}")
-                raise e
+                self.logger.warning("Trying emergency model")
+                emergency_model = self.get_emergency_model()
+                embeddings = emergency_model.encode(texts, convert_to_tensor=False, device='cpu')
+                for i, chunk_id in enumerate(chunk_ids):
+                    self.cpu_cache[chunk_id] = embeddings[i]
+                return embeddings
         
-        try:
-            if self.should_offload_to_cpu():
-                self.offload_oldest_gpu_embeddings(count=20)
-            
-            embeddings = model.encode(texts, convert_to_tensor=False, device='cuda')
-            
-            for i, chunk_id in enumerate(chunk_ids):
-                self.gpu_cache[chunk_id] = embeddings[i]
+        current_model_type = model_type
+        current_batch_size = len(texts)
+        
+        for recovery_attempt in range(4):  
+            try:
+                if recovery_attempt > 0:
+                    self.logger.info(f"GPU recovery attempt {recovery_attempt}: trying with {current_model_type} model, batch size {current_batch_size}")
                 
-                if len(self.gpu_cache) > self.max_gpu_cache_size:
-                    self.gpu_cache.popitem(last=False) 
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            return embeddings
-            
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                self.logger.warning(f"GPU OOM during encoding: {e}. Falling back to CPU")
+                if self.should_offload_to_cpu():
+                    self.offload_oldest_gpu_embeddings(count=30)  
                 
-                self.gpu_cache.clear()
+                model = self.get_embedding_model(current_model_type)
+                
+                embeddings = model.encode(texts, convert_to_tensor=False, device='cuda')
+                
+                for i, chunk_id in enumerate(chunk_ids):
+                    self.gpu_cache[chunk_id] = embeddings[i]
+                    
+                    if len(self.gpu_cache) > self.max_gpu_cache_size:
+                        self.gpu_cache.popitem(last=False) 
+                
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
-                try:
-                    embeddings = model.encode(texts, convert_to_tensor=False, device='cpu')
-                    for i, chunk_id in enumerate(chunk_ids):
-                        self.cpu_cache[chunk_id] = embeddings[i]
-                    return embeddings
-                except Exception as cpu_e:
-                    self.logger.error(f"CPU fallback also failed: {cpu_e}")
-                    raise cpu_e
-            else:
-                raise e
+                return embeddings
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                    self.logger.warning(f"GPU OOM during encoding: {e}. Attempting recovery...")
+                    
+                    if recovery_attempt == 0:
+                        self.logger.info("Recovery 1: Clearing GPU cache and retrying")
+                        self.gpu_cache.clear()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                        continue
+                    
+                    elif recovery_attempt == 1:
+                        if current_model_type == 'heavy':
+                            current_model_type = 'medium'
+                            self.logger.info("Recovery 2: Switching to medium model")
+                        elif current_model_type == 'medium':
+                            current_model_type = 'light'
+                            self.logger.info("Recovery 2: Switching to light model")
+                        else:
+                            current_model_type = 'emergency'
+                            self.logger.info("Recovery 2: Switching to emergency model")
+                        continue
+                    
+                    elif recovery_attempt == 2:
+                        if current_batch_size > 1:
+                            self.logger.info(f"Recovery 3: Reducing batch size from {current_batch_size} to smaller chunks")
+                            all_embeddings = []
+                            
+                            for i in range(0, len(texts), max(1, current_batch_size // 2)):
+                                batch_texts = texts[i:i + max(1, current_batch_size // 2)]
+                                batch_ids = chunk_ids[i:i + max(1, current_batch_size // 2)]
+                                
+                                try:
+                                    batch_embeddings = model.encode(batch_texts, convert_to_tensor=False, device='cuda')
+                                    all_embeddings.append(batch_embeddings)
+                                    
+                                    for j, chunk_id in enumerate(batch_ids):
+                                        self.gpu_cache[chunk_id] = batch_embeddings[j]
+                                        if len(self.gpu_cache) > self.max_gpu_cache_size:
+                                            self.gpu_cache.popitem(last=False)
+                                    
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                        
+                                except RuntimeError as batch_e:
+                                    if "out of memory" in str(batch_e).lower():
+                                        self.logger.warning("Even smaller batch failed, trying CPU")
+                                        break
+                                    else:
+                                        raise batch_e
+                            
+                            if len(all_embeddings) > 0:
+                                if len(all_embeddings) == 1:
+                                    return all_embeddings[0]
+                                else:
+                                    return np.vstack(all_embeddings)
+                            else:
+                                continue
+                        else:
+                            continue
+                    
+                    elif recovery_attempt == 3:
+                        self.logger.info("Recovery 4: Maximum cleanup and emergency model")
+                        self.gpu_cache.clear()
+                        self.cpu_cache.clear()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                        
+                        current_model_type = 'emergency'
+                        continue
+                
+                else:
+                    raise e
+        
+        self.logger.warning("All GPU recovery attempts failed, falling back to CPU")
+        
+        self.gpu_cache.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        try:
+            model = self.get_embedding_model(model_type)
+            embeddings = model.encode(texts, convert_to_tensor=False, device='cpu')
+            for i, chunk_id in enumerate(chunk_ids):
+                self.cpu_cache[chunk_id] = embeddings[i]
+            return embeddings
+        except Exception as cpu_e:
+            self.logger.error(f"CPU fallback also failed: {cpu_e}")
+            self.logger.warning("Trying emergency model as last resort")
+            emergency_model = self.get_emergency_model()
+            embeddings = emergency_model.encode(texts, convert_to_tensor=False, device='cpu')
+            for i, chunk_id in enumerate(chunk_ids):
+                self.cpu_cache[chunk_id] = embeddings[i]
+            return embeddings
     
     def get_embeddings_for_search(self, chunk_ids: List[str]) -> Tuple[np.ndarray, List[str]]:
         """Get embeddings for search, pulling from GPU/CPU as needed"""
@@ -370,16 +459,16 @@ class HybridMemoryManager:
         return large_file or large_text or high_memory or high_gpu
     
     def encode_texts_piece_by_piece(self, texts: List[str], chunk_ids: List[str] = None, model_type: str = 'light') -> np.ndarray:
-        """Encode texts in small pieces to prevent memory issues with dynamic model selection"""
+        """Encode texts in very small pieces to prevent memory issues with aggressive GPU recovery"""
         if chunk_ids is None:
             chunk_ids = [str(i) for i in range(len(texts))]
         
-        model = self.get_embedding_model(model_type)
+        current_model_type = model_type
         all_embeddings = []
         
-        piece_size = min(self.max_batch_size, max(1, len(texts) // 10)) 
+        piece_size = min(self.max_batch_size, max(1, len(texts) // 20)) 
         
-        self.logger.info(f"Processing {len(texts)} texts in pieces of {piece_size} using {model_type} model")
+        self.logger.info(f"Processing {len(texts)} texts in pieces of {piece_size} using {current_model_type} model")
         
         for i in range(0, len(texts), piece_size):
             piece_texts = texts[i:i + piece_size]
@@ -388,47 +477,146 @@ class HybridMemoryManager:
             if self.should_use_cpu_only():
                 self.logger.info(f"Memory critical, processing piece {i//piece_size + 1} on CPU")
                 try:
+                    model = self.get_embedding_model(current_model_type)
                     piece_embeddings = model.encode(piece_texts, convert_to_tensor=False, device='cpu')
                     for j, chunk_id in enumerate(piece_ids):
                         self.cpu_cache[chunk_id] = piece_embeddings[j]
                     all_embeddings.append(piece_embeddings)
                 except Exception as e:
                     self.logger.error(f"CPU encoding failed for piece {i//piece_size + 1}: {e}")
-                    raise e
-            else:
-                try:
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                    piece_embeddings = model.encode(piece_texts, convert_to_tensor=False, device='cuda')
-                    
+                    self.logger.warning("Trying emergency model for this piece")
+                    emergency_model = self.get_emergency_model()
+                    piece_embeddings = emergency_model.encode(piece_texts, convert_to_tensor=False, device='cpu')
                     for j, chunk_id in enumerate(piece_ids):
-                        self.gpu_cache[chunk_id] = piece_embeddings[j]
-                    
+                        self.cpu_cache[chunk_id] = piece_embeddings[j]
                     all_embeddings.append(piece_embeddings)
-                    
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
-                        self.logger.warning(f"GPU OOM on piece {i//piece_size + 1}, switching to CPU")
-                        self.gpu_cache.clear()
+            else:
+                piece_embeddings = None
+                current_piece_model = current_model_type
+                
+                for recovery_attempt in range(4): 
+                    try:
+                        if recovery_attempt > 0:
+                            self.logger.info(f"Piece {i//piece_size + 1} GPU recovery attempt {recovery_attempt}: trying with {current_piece_model} model")
+                        
+                        if self.should_offload_to_cpu():
+                            self.offload_oldest_gpu_embeddings(count=25)
+                        
+                        model = self.get_embedding_model(current_piece_model)
+                        
+                        piece_embeddings = model.encode(piece_texts, convert_to_tensor=False, device='cuda')
+                        
+                        for j, chunk_id in enumerate(piece_ids):
+                            self.gpu_cache[chunk_id] = piece_embeddings[j]
+                            if len(self.gpu_cache) > self.max_gpu_cache_size:
+                                self.gpu_cache.popitem(last=False)
+                        
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                         
-                        try:
-                            piece_embeddings = model.encode(piece_texts, convert_to_tensor=False, device='cpu')
-                            for j, chunk_id in enumerate(piece_ids):
-                                self.cpu_cache[chunk_id] = piece_embeddings[j]
-                            all_embeddings.append(piece_embeddings)
-                        except Exception as cpu_e:
-                            self.logger.error(f"CPU fallback also failed: {cpu_e}")
-                            raise cpu_e
-                    else:
-                        raise e
+                        break  
+                        
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                            self.logger.warning(f"Piece {i//piece_size + 1} GPU OOM: {e}. Attempting recovery...")
+                            
+                            if recovery_attempt == 0:
+                                self.logger.info(f"Piece {i//piece_size + 1} Recovery 1: Clearing GPU cache and retrying")
+                                self.gpu_cache.clear()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                gc.collect()
+                                continue
+                            
+                            elif recovery_attempt == 1:
+                                if current_piece_model == 'heavy':
+                                    current_piece_model = 'medium'
+                                    self.logger.info(f"Piece {i//piece_size + 1} Recovery 2: Switching to medium model")
+                                elif current_piece_model == 'medium':
+                                    current_piece_model = 'light'
+                                    self.logger.info(f"Piece {i//piece_size + 1} Recovery 2: Switching to light model")
+                                else:
+                                    current_piece_model = 'emergency'
+                                    self.logger.info(f"Piece {i//piece_size + 1} Recovery 2: Switching to emergency model")
+                                continue
+                            
+                            elif recovery_attempt == 2:
+                                if len(piece_texts) > 1:
+                                    self.logger.info(f"Piece {i//piece_size + 1} Recovery 3: Reducing piece size from {len(piece_texts)} to smaller chunks")
+                                    sub_piece_embeddings = []
+                                    
+                                    for j in range(0, len(piece_texts), max(1, len(piece_texts) // 2)):
+                                        sub_texts = piece_texts[j:j + max(1, len(piece_texts) // 2)]
+                                        sub_ids = piece_ids[j:j + max(1, len(piece_texts) // 2)]
+                                        
+                                        try:
+                                            sub_embeddings = model.encode(sub_texts, convert_to_tensor=False, device='cuda')
+                                            sub_piece_embeddings.append(sub_embeddings)
+                                            
+                                            for k, chunk_id in enumerate(sub_ids):
+                                                self.gpu_cache[chunk_id] = sub_embeddings[k]
+                                                if len(self.gpu_cache) > self.max_gpu_cache_size:
+                                                    self.gpu_cache.popitem(last=False)
+                                            
+                                            if torch.cuda.is_available():
+                                                torch.cuda.empty_cache()
+                                                
+                                        except RuntimeError as sub_e:
+                                            if "out of memory" in str(sub_e).lower():
+                                                self.logger.warning(f"Piece {i//piece_size + 1} even smaller sub-piece failed, will try CPU")
+                                                break
+                                            else:
+                                                raise sub_e
+                                    
+                                    if len(sub_piece_embeddings) > 0:
+                                        if len(sub_piece_embeddings) == 1:
+                                            piece_embeddings = sub_piece_embeddings[0]
+                                        else:
+                                            piece_embeddings = np.vstack(sub_piece_embeddings)
+                                        break  
+                                    else:
+                                        continue
+                                else:
+                                    continue
+                            
+                            elif recovery_attempt == 3:
+                                self.logger.info(f"Piece {i//piece_size + 1} Recovery 4: Maximum cleanup and emergency model")
+                                self.gpu_cache.clear()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                gc.collect()
+                                
+                                current_piece_model = 'emergency'
+                                continue
+                        
+                        else:
+                            raise e
+                
+                if piece_embeddings is None:
+                    self.logger.warning(f"All GPU recovery attempts failed for piece {i//piece_size + 1}, falling back to CPU")
+                    
+                    self.gpu_cache.clear()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    try:
+                        model = self.get_embedding_model(current_model_type)
+                        piece_embeddings = model.encode(piece_texts, convert_to_tensor=False, device='cpu')
+                        for j, chunk_id in enumerate(piece_ids):
+                            self.cpu_cache[chunk_id] = piece_embeddings[j]
+                    except Exception as cpu_e:
+                        self.logger.error(f"CPU fallback also failed for piece {i//piece_size + 1}: {cpu_e}")
+                        self.logger.warning(f"Trying emergency model for piece {i//piece_size + 1}")
+                        emergency_model = self.get_emergency_model()
+                        piece_embeddings = emergency_model.encode(piece_texts, convert_to_tensor=False, device='cpu')
+                        for j, chunk_id in enumerate(piece_ids):
+                            self.cpu_cache[chunk_id] = piece_embeddings[j]
+                
+                all_embeddings.append(piece_embeddings)
             
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             self.logger.info(f"Completed piece {i//piece_size + 1}/{(len(texts) + piece_size - 1)//piece_size}")
         
@@ -479,7 +667,6 @@ class DocumentCacheManager:
             cache_path = self._get_cache_path(url)
             metadata_path = self._get_metadata_path(url)
             
-            # Save chunks
             chunk_data = {
                 'chunks': [{'text': chunk.text, 'metadata': chunk.metadata} for chunk in chunks],
                 'model_type': model_type,
@@ -490,7 +677,6 @@ class DocumentCacheManager:
             with open(cache_path, 'wb') as f:
                 pickle.dump(chunk_data, f)
             
-            # Save metadata
             metadata = {
                 'url': url,
                 'model_type': model_type,
@@ -519,11 +705,9 @@ class DocumentCacheManager:
             if not cache_path.exists() or not metadata_path.exists():
                 raise FileNotFoundError("Cache files not found")
             
-            # Load chunks
             with open(cache_path, 'rb') as f:
                 chunk_data = pickle.load(f)
             
-            # Reconstruct DocumentChunk objects
             chunks = []
             for chunk_info in chunk_data['chunks']:
                 chunk = DocumentChunk(
@@ -569,7 +753,6 @@ class DocumentCacheManager:
                 
                 self.logger.info(f"Cleared cache for: {url}")
             else:
-                # Clear all cache
                 for file_path in self.cache_dir.glob("*.pkl"):
                     file_path.unlink()
                 for file_path in self.cache_dir.glob("*_metadata.json"):
@@ -613,7 +796,74 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-groq_client = Groq(api_key=os.environ.get("API_KEY") ,)
+logger = logging.getLogger(__name__)
+
+class RoundRobinAPIKeyManager:
+    """Simple round-robin API key rotation to distribute load"""
+    
+    def __init__(self):
+        all_keys = [
+            ("API_KEY", os.environ.get("API_KEY")),
+            ("API_KEY_SECOND", os.environ.get("API_KEY_SECOND")),
+            ("API_KEY_THIRD", os.environ.get("API_KEY_THIRD")),
+            ("API_KEY_FOURTH", os.environ.get("API_KEY_FOURTH")),
+            ("API_KEY_FIFTH", os.environ.get("API_KEY_FIFTH")),
+            ("API_KEY_SIXTH", os.environ.get("API_KEY_SIXTH")),
+            ("API_KEY_SEVENTH", os.environ.get("API_KEY_SEVENTH")),
+            ("API_KEY_EIGTH", os.environ.get("API_KEY_EIGTH")),
+            ("API_KEY_NINTH", os.environ.get("API_KEY_NINTH")),
+            
+        ]
+        
+        self.api_keys = []
+        self.key_names = []
+        
+        for key_name, key_value in all_keys:
+            if key_value is not None and key_value.strip():
+                self.api_keys.append(key_value)
+                self.key_names.append(key_name)
+                logger.info(f"✅ API key loaded: {key_name}")
+            else:
+                logger.warning(f"❌ API key missing: {key_name}")
+        
+        if not self.api_keys:
+            raise ValueError("No valid API keys found! Please check your .env file.")
+        
+        self.current_index = 0
+        self.request_count = 0
+        
+        logger.info(f"🎯 Loaded {len(self.api_keys)} valid API keys for rotation")
+    
+    def get_next_key(self):
+        """Get next API key in round-robin fashion"""
+        if not self.api_keys:
+            raise ValueError("No API keys available!")
+        
+        key = self.api_keys[self.current_index]
+        key_name = self.key_names[self.current_index]
+        
+        self.current_index = (self.current_index + 1) % len(self.api_keys)
+        self.request_count += 1
+        
+        logger.info(f"Using API key: {key_name} (request #{self.request_count})")
+        return key
+    
+    def create_client(self):
+        """Create a new Groq client with the next API key"""
+        return Groq(api_key=self.get_next_key())
+    
+    def get_stats(self):
+        """Get rotation statistics"""
+        return {
+            "total_requests": self.request_count,
+            "current_key_index": self.current_index,
+            "key_names": self.key_names,
+            "total_keys": len(self.api_keys),
+            "available_keys": len(self.api_keys)
+        }
+
+api_key_manager = RoundRobinAPIKeyManager()
+groq_client = api_key_manager.create_client()
 
 
 @asynccontextmanager
@@ -886,25 +1136,20 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to extract text from PDF: {str(e)}")
 
-def chunk_text_piece_by_piece(text: str, chunk_size: int = 300, overlap: int = 50) -> Generator[List[str], None, None]:
+def chunk_text_piece_by_piece(text: str, chunk_size: int = 700, overlap: int = 100) -> Generator[List[str], None, None]:
     """Split text into very small chunks for piece-by-piece processing"""
     text = re.sub(r'\n+', '\n', text)
     text = re.sub(r'\s+', ' ', text)
     text = text.strip()
-    
     sentences = nltk.sent_tokenize(text)
-    
     chunks = []
     current_chunk = ""
     current_length = 0
     max_chunks_per_piece = 20 
-    
     for sentence in sentences:
         sentence_length = len(sentence.split())
-        
         if current_length + sentence_length > chunk_size and current_chunk:
             chunks.append(current_chunk.strip())
-            
             words = current_chunk.split()
             if len(words) > overlap:
                 overlap_text = " ".join(words[-overlap:])
@@ -919,40 +1164,32 @@ def chunk_text_piece_by_piece(text: str, chunk_size: int = 300, overlap: int = 5
             else:
                 current_chunk = sentence
             current_length += sentence_length
-        
         if len(chunks) >= max_chunks_per_piece:
             valid_chunks = [chunk for chunk in chunks if len(chunk.split()) > 10]
             if valid_chunks:
                 yield valid_chunks
             chunks = []
             gc.collect()  
-    
     if current_chunk.strip():
         chunks.append(current_chunk.strip())
-    
     if chunks:
         valid_chunks = [chunk for chunk in chunks if len(chunk.split()) > 10]
         if valid_chunks:
             yield valid_chunks
 
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+def chunk_text(text: str, chunk_size: int = 700, overlap: int = 100) -> List[str]:
     """Split text into overlapping chunks with better strategy (legacy method)"""
     text = re.sub(r'\n+', '\n', text)
     text = re.sub(r'\s+', ' ', text)
     text = text.strip()
-    
     sentences = nltk.sent_tokenize(text)
-    
     chunks = []
     current_chunk = ""
     current_length = 0
-    
     for sentence in sentences:
         sentence_length = len(sentence.split())
-        
         if current_length + sentence_length > chunk_size and current_chunk:
             chunks.append(current_chunk.strip())
-            
             words = current_chunk.split()
             if len(words) > overlap:
                 overlap_text = " ".join(words[-overlap:])
@@ -967,73 +1204,68 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[st
             else:
                 current_chunk = sentence
             current_length += sentence_length
-    
     if current_chunk.strip():
         chunks.append(current_chunk.strip())
-    
     chunks = [chunk for chunk in chunks if len(chunk.split()) > 10]
-    
     return chunks
 
 
-async def generate_answer(question: str, relevant_chunks: List[DocumentChunk]) -> str:
-    """Generate answer using llama-3.1-8b-instant"""
-    try:
-        context = "\n\n".join([chunk.text for chunk in relevant_chunks])
-        
-        encoding = tiktoken.get_encoding("cl100k_base") 
-        context_tokens = encoding.encode(context)
-        
-        max_context_tokens = 4900
-        if len(context_tokens) > max_context_tokens:
-            context_tokens = context_tokens[:max_context_tokens]
-            context = encoding.decode(context_tokens)
-        
-        prompt = f"""Based on the following document content, provide a direct and complete answer to the question in 1-4 sentence depending on the question and prioritize completeness over brevity.
-
-Document Content:
-{context}
-
-Question: {question}
-
-Instructions:
-- Answer in 1-3 sentences only and no extra legal texts, but make it short and complete, don't remove the necessary information even in slightest
-- Be direct and to the point
-- No bullet points, no lists, no explanations
-- If information is not available, simply say "This information is not available in the document"
-- Use specific details from the document when available"""
-
-        response = await asyncio.to_thread(
-            groq_client.chat.completions.create,
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that answers questions based on document content. Always provide accurate, direct answers based on the provided context."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=400,
-            temperature=0.1
-        )
-        
-        answer = response.choices[0].message.content.strip()
-        
-        no_info_indicators = [
-            "not available", "not found", "not mentioned", "not specified",
-            "not provided", "not stated", "not included", "not covered",
-            "no information", "no details", "no mention", "no data",
-            "cannot find", "unable to find", "does not contain"
-        ]
-        
-        answer_lower = answer.lower()
-        if any(indicator in answer_lower for indicator in no_info_indicators):
-            return answer, False 
-        
-        return answer, True 
-    
-    except Exception as e:
-        logger.error(f"Error generating answer: {str(e)}")
-        if "6000" in str(e) or "tpm" in str(e).lower() or "rate limit" in str(e).lower():
-            return "TPM_LIMIT_HIT", False 
-        return f"Error generating answer: {str(e)}", False
+async def generate_answer(question: str, relevant_chunks: List[DocumentChunk], max_api_retries: int = 4) -> str:
+    """Generate answer using llama-3.1-8b-instant, with API key rotation on TPM/429 errors"""
+    attempt = 0
+    while attempt < max_api_retries:
+        try:
+            context = "\n\n".join([chunk.text for chunk in relevant_chunks])
+            encoding = tiktoken.get_encoding("cl100k_base") 
+            context_tokens = encoding.encode(context)
+            max_context_tokens = 4900
+            if len(context_tokens) > max_context_tokens:
+                context_tokens = context_tokens[:max_context_tokens]
+                context = encoding.decode(context_tokens)
+            prompt = f"""Based on the following document content, provide a direct and complete answer to the question in 1-4 sentence depending on the question and prioritize completeness over brevity.\n\nDocument Content:\n{context}\n\nQuestion: {question}\n\nInstructions:\n- Answer in 1-3 sentences only and no extra legal texts, but make it short and complete, don't remove the necessary information even in slightest\n- Be direct and to the point\n- No bullet points, no lists, no explanations\n- If information is not available, simply say \"This information is not available in the document\"\n- Use specific details from the document when available"""
+            start_time = time.time()
+            response = await asyncio.to_thread(
+                api_key_manager.create_client().chat.completions.create,
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that answers questions based on document content. Always provide accurate, direct answers based on the provided context."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=400,
+                temperature=0.1
+            )
+            elapsed = time.time() - start_time
+            answer = response.choices[0].message.content.strip()
+            no_info_indicators = [
+                "not available", "not found", "not mentioned", "not specified",
+                "not provided", "not stated", "not included", "not covered",
+                "no information", "no details", "no mention", "no data",
+                "cannot find", "unable to find", "does not contain"
+            ]
+            answer_lower = answer.lower()
+            if any(indicator in answer_lower for indicator in no_info_indicators):
+                return answer, False 
+            return answer, True 
+        except Exception as e:
+            logger.error(f"Error generating answer (attempt {attempt+1}): {str(e)}")
+            err_str = str(e).lower()
+            if ("6000" in err_str or "tpm" in err_str or "rate limit" in err_str or "429" in err_str) or (('too many request' in err_str or 'rate limit' in err_str or '429' in err_str) and 'timeout' in err_str):
+                attempt += 1
+                logger.info(f"Switching API key and retrying (attempt {attempt+1})...")
+                continue
+            if hasattr(e, 'response') and hasattr(e.response, 'status_code') and e.response.status_code == 429:
+                if elapsed > 4:
+                    attempt += 1
+                    logger.info(f"429 error after {elapsed:.2f}s, switching API key and retrying (attempt {attempt+1})...")
+                    continue
+            if "tpm_limit_hit" in err_str:
+                attempt += 1
+                logger.info(f"TPM limit hit, switching API key and retrying (attempt {attempt+1})...")
+                continue
+            if attempt == max_api_retries - 1:
+                return f"Error generating answer: {str(e)}", False
+            attempt += 1
+    return "TPM_LIMIT_HIT", False
 
 async def summarize_answer(raw_answer: str, question: str) -> str:
     """Summarize verbose or legal-style answers into a clean, single-sentence form"""
@@ -1050,7 +1282,7 @@ Instruction:
 - Do not say 'According to the document...' or similar prefixes"""
 
         response = await asyncio.to_thread(
-            groq_client.chat.completions.create,
+            api_key_manager.create_client().chat.completions.create,
             model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": "You are a summarizer that rewrites verbose legal answers into clean, human-friendly summaries, Formal and precise,  but don't remove the information even in slightest."},
@@ -1066,79 +1298,78 @@ Instruction:
         return raw_answer 
 
 async def generate_answer_with_retry(question: str, search_engine, start_k: int = 5) -> str:
-    """Generate answer with hybrid search and smart retry logic"""
-    max_attempts = 8
+    """Generate answer with hybrid search and smart retry logic, with API key rotation on error"""
+    max_api_retries = len(api_key_manager.api_keys)
+    max_attempts = 2  
     used_chunks = set()
-    
     logger.info("Starting with hybrid search for better initial results")
     hybrid_chunks = search_engine.hybrid_search(question, top_k=start_k)
-    
     if hybrid_chunks:
         for chunk in hybrid_chunks:
             chunk_idx = search_engine.chunks.index(chunk)
             used_chunks.add(chunk_idx)
-        
         logger.info(f"Hybrid search found {len(hybrid_chunks)} relevant chunks")
-        answer, success = await generate_answer(question, hybrid_chunks)
-        
+        answer, success = await generate_answer(question, hybrid_chunks, max_api_retries=max_api_retries)
         if answer == "TPM_LIMIT_HIT":
-            logger.info("TPM limit hit on hybrid search, waiting 60 seconds...")
-            await asyncio.sleep(60)
-        elif success:
+            logger.info("TPM limit hit on hybrid search, switching API key and retrying immediately...")
+            continue_retry = True
+            retry_count = 0
+            while continue_retry and retry_count < max_api_retries:
+                answer, success = await generate_answer(question, hybrid_chunks, max_api_retries=max_api_retries)
+                if answer != "TPM_LIMIT_HIT":
+                    continue_retry = False
+                retry_count += 1
+        if success:
             logger.info("Successfully generated answer with hybrid search")
             summarized_answer = await summarize_answer(answer, question)
             return summarized_answer
-    
     for attempt in range(max_attempts):
         logger.info(f"Progressive attempt {attempt + 1}: Searching for new chunks")
-        
         new_chunks, current_k, max_k = search_engine.search_progressive(
             question, start_k=3, max_k=None, used_chunks=used_chunks
         )
-        
         if not new_chunks:
             logger.info("No more new chunks available to search")
             break
-        
         logger.info(f"Found {len(new_chunks)} new relevant chunks for attempt {attempt + 1}")
-        
-        answer, success = await generate_answer(question, new_chunks)
-        
+        answer, success = await generate_answer(question, new_chunks, max_api_retries=max_api_retries)
         if answer == "TPM_LIMIT_HIT":
-            logger.info(f"TPM limit hit on attempt {attempt + 1}, waiting 60 seconds...")
-            await asyncio.sleep(60)
-            continue
-        
+            logger.info(f"TPM limit hit on attempt {attempt + 1}, switching API key and retrying immediately...")
+            continue_retry = True
+            retry_count = 0
+            while continue_retry and retry_count < max_api_retries:
+                answer, success = await generate_answer(question, new_chunks, max_api_retries=max_api_retries)
+                if answer != "TPM_LIMIT_HIT":
+                    continue_retry = False
+                retry_count += 1
         if success:
             logger.info(f"Successfully generated answer on attempt {attempt + 1}")
             summarized_answer = await summarize_answer(answer, question)
             return summarized_answer
-        
         logger.info(f"No useful answer found on attempt {attempt + 1}")
-        
-        await asyncio.sleep(3)
-    
-    logger.info("Trying final comprehensive search with all remaining chunks")
+        await asyncio.sleep(0.1)
+    logger.info("Trying 4th attempt: comprehensive search with all remaining chunks")
     remaining_chunks = []
     for i, chunk in enumerate(search_engine.chunks):
         if i not in used_chunks:
             remaining_chunks.append(chunk)
-    
     if remaining_chunks:
-        logger.info(f"Final search with {len(remaining_chunks)} remaining chunks")
-        answer, success = await generate_answer(question, remaining_chunks)
-        
+        logger.info(f"4th attempt: searching with {len(remaining_chunks)} remaining chunks")
+        answer, success = await generate_answer(question, remaining_chunks, max_api_retries=max_api_retries)
         if answer == "TPM_LIMIT_HIT":
-            logger.info("TPM limit hit on final search, waiting 60 seconds...")
-            await asyncio.sleep(60)
-            answer, success = await generate_answer(question, remaining_chunks)
-        
+            logger.info("TPM limit hit on 4th attempt, switching API key and retrying immediately...")
+            continue_retry = True
+            retry_count = 0
+            while continue_retry and retry_count < max_api_retries:
+                answer, success = await generate_answer(question, remaining_chunks, max_api_retries=max_api_retries)
+                if answer != "TPM_LIMIT_HIT":
+                    continue_retry = False
+                retry_count += 1
         if success:
-            logger.info("Successfully generated answer on final search")
+            logger.info("Successfully generated answer on 4th attempt")
             summarized_answer = await summarize_answer(answer, question)
             return summarized_answer
-    
-    logger.info("No answer found after comprehensive search")
+    logger.info("No answer found after 4 attempts")
     return "This information is not available in the document"
 
 @api_router.get("/")
@@ -1272,7 +1503,6 @@ async def get_cache_stats():
 async def get_cache_info(url: str):
     """Get cache information for a specific document URL"""
     try:
-        # Decode URL if it's encoded
         import urllib.parse
         decoded_url = urllib.parse.unquote(url)
         
@@ -1336,44 +1566,48 @@ async def list_cached_documents():
         logger.error(f"Error listing cached documents: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to list cached documents: {str(e)}")
 
+@api_router.get("/api-keys/status")
+async def get_api_key_status():
+    """Get round-robin API key rotation status"""
+    try:
+        stats = api_key_manager.get_stats()
+        return {
+            "api_key_stats": stats,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error getting API key status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get API key status: {str(e)}")
+
 async def process_hackrx_request(request: HackRXRequest):
     """Internal function to process HackRX request with caching"""
     logger.info(f"Processing request with document: {request.documents}")
     logger.info(f"Questions: {len(request.questions)}")
     
-    # Check if document is already cached
     if document_cache_manager.is_cached(request.documents):
         logger.info(f"Document found in cache: {request.documents}")
         try:
-            # Load chunks from cache
             chunks, model_type, file_size = document_cache_manager.load_chunks(request.documents)
             logger.info(f"Loaded {len(chunks)} chunks from cache")
             
-            # Create search engine with cached chunks
             search_engine = SemanticSearchEngine(model_type=model_type)
             search_engine.add_chunks(chunks)
             
-            # Process questions
-            answers = []
-            for i, question in enumerate(request.questions):
-                logger.info(f"Processing question {i+1}/{len(request.questions)}: {question}")
-                
+            async def answer_one(idx, question):
+                logger.info(f"Processing question {idx+1}/{len(request.questions)}: {question}")
                 normalized_question = normalize_question(question)
                 answer = await generate_answer_with_retry(question, search_engine, start_k=5)
-                answers.append(answer)
                 logger.info(f"Generated answer: {answer[:100]}...")
-                
-                if i % 3 == 0:
-                    memory_manager.cleanup_memory()
-                    logger.info("Periodic memory cleanup performed")
-            
+                return answer
+
+            answers = await asyncio.gather(*[answer_one(i, q) for i, q in enumerate(request.questions)])
             logger.info("All questions processed successfully from cache")
             logger.info(f"Returning response with {len(answers)} answers")
-            
             try:
                 final_response = HackRXResponse(answers=answers)
                 logger.info("Response object created successfully")
                 logger.info(f"Response content: {final_response.answers}")
+                asyncio.create_task(asyncio.to_thread(memory_manager.cleanup_memory))
                 return final_response
             except Exception as response_error:
                 logger.error(f"Error creating response: {response_error}")
@@ -1382,9 +1616,7 @@ async def process_hackrx_request(request: HackRXRequest):
         except Exception as cache_error:
             logger.error(f"Error loading from cache: {cache_error}")
             logger.info("Falling back to normal processing")
-            # Continue with normal processing if cache loading fails
     
-    # Normal processing path (not cached or cache failed)
     initial_stats = memory_manager.get_memory_stats()
     logger.info(f"Initial memory stats: {initial_stats}")
     
@@ -1408,6 +1640,7 @@ async def process_hackrx_request(request: HackRXRequest):
         final_response = HackRXResponse(answers=response.answers)
         logger.info("Response object created successfully")
         logger.info(f"Response content: {final_response.answers}")
+        asyncio.create_task(asyncio.to_thread(memory_manager.cleanup_memory))
         return final_response
     except Exception as response_error:
         logger.error(f"Error creating response: {response_error}")
@@ -1441,40 +1674,33 @@ async def process_large_document_piece_by_piece(request: HackRXRequest, pdf_byte
         
         total_chunks = 0
         piece_count = 0
-        all_document_chunks = []  # Collect all chunks for caching
+        all_document_chunks = []  
         
         for text_piece in extract_text_from_pdf_streaming(pdf_bytes, max_pages_per_chunk=5):
             piece_count += 1
             logger.info(f"Processing text piece {piece_count}, length: {len(text_piece)} characters")
-            
             if len(text_piece) > 100000:  
                 logger.info(f"Large text piece detected, using piece-by-piece chunking")
-                
-                for chunk_piece in chunk_text_piece_by_piece(text_piece, chunk_size=200, overlap=30):
+                for chunk_piece in chunk_text_piece_by_piece(text_piece, chunk_size=700, overlap=100):
                     document_chunks = [DocumentChunk(text=chunk_text) for chunk_text in chunk_piece]
                     search_engine.add_chunks_piece_by_piece(document_chunks)
-                    all_document_chunks.extend(document_chunks)  # Collect for caching
+                    all_document_chunks.extend(document_chunks) 
                     total_chunks += len(chunk_piece)
-                    
                     memory_manager.cleanup_memory()
                     gc.collect()
-                    
                     logger.info(f"Added chunk piece with {len(chunk_piece)} chunks. Total chunks: {total_chunks}")
             else:
-                chunks_text = chunk_text(text_piece, chunk_size=300, overlap=50)
+                chunks_text = chunk_text(text_piece, chunk_size=700, overlap=100)
                 document_chunks = [DocumentChunk(text=chunk_text) for chunk_text in chunks_text]
                 search_engine.add_chunks_piece_by_piece(document_chunks)
-                all_document_chunks.extend(document_chunks)  # Collect for caching
+                all_document_chunks.extend(document_chunks) 
                 total_chunks += len(chunks_text)
-                
                 memory_manager.cleanup_memory()
                 gc.collect()
-                
                 logger.info(f"Added text piece with {len(chunks_text)} chunks. Total chunks: {total_chunks}")
         
         logger.info(f"Document processing completed. Total chunks: {total_chunks}")
         
-        # Save all chunks to cache for future use
         cache_success = document_cache_manager.save_chunks(
             request.documents, all_document_chunks, model_type, file_size
         )
@@ -1506,14 +1732,15 @@ async def process_large_document_piece_by_piece(request: HackRXRequest, pdf_byte
         response = HackRXResponse(answers=answers)
         logger.info("Response created, starting cleanup")
         
-        try:
-            memory_manager.cleanup_memory()
-            search_engine.clear_memory()
-            memory_manager.clear_model_cache()
-            logger.info("Cleanup completed")
-        except Exception as cleanup_error:
-            logger.warning(f"Cleanup error (non-critical): {cleanup_error}")
-        
+        def cleanup():
+            try:
+                memory_manager.cleanup_memory()
+                search_engine.clear_memory()
+                memory_manager.clear_model_cache()
+                logger.info("Cleanup completed")
+            except Exception as cleanup_error:
+                logger.warning(f"Cleanup error (non-critical): {cleanup_error}")
+        asyncio.create_task(asyncio.to_thread(cleanup))
         return response
         
     except Exception as e:
@@ -1532,12 +1759,12 @@ async def process_document_standard(request: HackRXRequest, pdf_bytes: bytes, fi
         logger.info(f"Extracted text length: {len(text)} characters")
         
         if file_size > 50 * 1024 * 1024:  
-            chunk_size = 500
+            chunk_size = 700
             overlap = 100
             logger.info(f"Large file detected, using smaller chunks: {chunk_size} words with {overlap} overlap")
         else:
-            chunk_size = 1000
-            overlap = 200
+            chunk_size = 700
+            overlap = 100
         
         chunks_text = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
         logger.info(f"Created {len(chunks_text)} chunks")
@@ -1546,7 +1773,6 @@ async def process_document_standard(request: HackRXRequest, pdf_bytes: bytes, fi
         
         model_type = memory_manager.select_model_for_pdf_size(file_size)
         
-        # Save chunks to cache for future use
         cache_success = document_cache_manager.save_chunks(
             request.documents, document_chunks, model_type, file_size
         )
@@ -1579,14 +1805,15 @@ async def process_document_standard(request: HackRXRequest, pdf_bytes: bytes, fi
         response = HackRXResponse(answers=answers)
         logger.info("Response created, starting cleanup")
         
-        try:
-            memory_manager.cleanup_memory()
-            search_engine.clear_memory()
-            memory_manager.clear_model_cache()
-            logger.info("Cleanup completed")
-        except Exception as cleanup_error:
-            logger.warning(f"Cleanup error (non-critical): {cleanup_error}")
-        
+        def cleanup():
+            try:
+                memory_manager.cleanup_memory()
+                search_engine.clear_memory()
+                memory_manager.clear_model_cache()
+                logger.info("Cleanup completed")
+            except Exception as cleanup_error:
+                logger.warning(f"Cleanup error (non-critical): {cleanup_error}")
+        asyncio.create_task(asyncio.to_thread(cleanup))
         return response
         
     except Exception as e:
@@ -1603,19 +1830,15 @@ async def process_simple_request(request: HackRXRequest):
     logger.info(f"Processing simple request with document: {request.documents}")
     logger.info(f"Questions: {len(request.questions)}")
     
-    # Check if document is already cached
     if document_cache_manager.is_cached(request.documents):
         logger.info(f"Document found in cache: {request.documents}")
         try:
-            # Load chunks from cache
             chunks, model_type, file_size = document_cache_manager.load_chunks(request.documents)
             logger.info(f"Loaded {len(chunks)} chunks from cache")
             
-            # Create search engine with cached chunks
             search_engine = SemanticSearchEngine(model_type=model_type)
             search_engine.add_chunks(chunks)
             
-            # Process questions
             answers = []
             for i, question in enumerate(request.questions):
                 logger.info(f"Processing question {i+1}/{len(request.questions)}: {question}")
@@ -1636,9 +1859,7 @@ async def process_simple_request(request: HackRXRequest):
         except Exception as cache_error:
             logger.error(f"Error loading from cache: {cache_error}")
             logger.info("Falling back to normal processing")
-            # Continue with normal processing if cache loading fails
     
-    # Normal processing path (not cached or cache failed)
     pdf_bytes = await download_pdf(request.documents)
     logger.info("PDF downloaded successfully")
     
@@ -1650,7 +1871,6 @@ async def process_simple_request(request: HackRXRequest):
     
     document_chunks = [DocumentChunk(text=chunk_text) for chunk_text in chunks_text]
     
-    # Save chunks to cache for future use
     file_size = len(pdf_bytes)
     cache_success = document_cache_manager.save_chunks(
         request.documents, document_chunks, 'heavy', file_size
