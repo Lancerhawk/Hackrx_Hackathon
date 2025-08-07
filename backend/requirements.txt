@@ -37,3 +37,4 @@ einops
 pynvml
 nvidia-ml-py
 psutil
+pinecone-client>=3.0.0

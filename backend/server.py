@@ -102,13 +102,15 @@ class HybridMemoryManager:
         
         self.model_configs = {
             'heavy': {
-                'name': 'nomic-ai/nomic-embed-text-v1',
+                # 'name': 'nomic-ai/nomic-embed-text-v1',
+                'name': 'all-MiniLM-L6-v2',
                 'dimension': 768,
                 'speed': 'slow',
                 'accuracy': 'high'
             },
             'medium': {
-                'name': 'all-mpnet-base-v2',
+                # 'name': 'all-mpnet-base-v2',
+                'name': 'all-MiniLM-L6-v2',
                 'dimension': 768,
                 'speed': 'medium',
                 'accuracy': 'high'
@@ -812,7 +814,12 @@ class RoundRobinAPIKeyManager:
             ("API_KEY_SEVENTH", os.environ.get("API_KEY_SEVENTH")),
             ("API_KEY_EIGTH", os.environ.get("API_KEY_EIGTH")),
             ("API_KEY_NINTH", os.environ.get("API_KEY_NINTH")),
-            
+            ("API_KEY_TENTH", os.environ.get("API_KEY_TENTH")),
+            ("API_KEY_ELEVEN", os.environ.get("API_KEY_ELEVEN")),
+            ("API_KEY_TWELVE", os.environ.get("API_KEY_TWELVE")),
+            ("API_KEY_THIRTEEN", os.environ.get("API_KEY_THIRTEEN")),
+            ("API_KEY_FOURTEEN", os.environ.get("API_KEY_FOURTEEN")),
+            ("API_KEY_FIFTEEN", os.environ.get("API_KEY_FIFTEEN"))
         ]
         
         self.api_keys = []
