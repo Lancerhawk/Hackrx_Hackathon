@@ -1,8 +1,8 @@
-# 🚀 HackRx AI - Advanced Document Processing & Question Answering Platform
+# 🚀 Scan AI - Advanced Document Processing & Question Answering Platform
 
 ## 📋 Overview
 
-HackRx AI is a sophisticated document processing and question-answering platform that leverages advanced AI technologies to extract insights from PDF documents. The platform features intelligent memory management, request queuing, and robust processing capabilities for handling documents of any size.
+ScanRx AI is a sophisticated document processing and question-answering platform that leverages advanced AI technologies to extract insights from PDF documents. The platform features intelligent memory management, request queuing, and robust processing capabilities for handling documents of any size.
 
 ## ✨ Key Features
 
