@@ -33,6 +33,16 @@ import hashlib
 import json
 import pickle
 
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import LLMChainExtractor
+import tempfile
+import os
+
 class RequestQueue:
     """Manages request queue for sequential processing"""
     
@@ -80,21 +90,21 @@ def normalize_question(question: str) -> str:
     return question.strip().lower()
 
 class HybridMemoryManager:
-    """Manages GPU/CPU hybrid memory with dynamic offloading"""
+    """Manages GPU/CPU hybrid memory with dynamic offloading for LangChain embeddings"""
     
     def __init__(self):
         self.gpu_available = GPU_AVAILABLE and torch.cuda.is_available()
-        self.gpu_memory_threshold = 0.85  
+        self.gpu_memory_threshold = 0.95  
         self.gpu_offload_threshold = 0.75  
         self.cpu_cache = OrderedDict()
         self.gpu_cache = OrderedDict()  
-        self.max_cpu_cache_size = 10000  
-        self.max_gpu_cache_size = 1000   
+        self.max_cpu_cache_size = 60000  
+        self.max_gpu_cache_size = 3000   
         self.embedding_models = {}  
         self.logger = logging.getLogger(__name__)
         
-        self.max_chunk_size = 700  
-        self.max_batch_size = 64   
+        self.max_chunk_size = 300  
+        self.max_batch_size = 8
         self.memory_safety_margin = 0.1
         
         self.small_pdf_threshold = 10 * 1024 * 1024 
@@ -120,8 +130,8 @@ class HybridMemoryManager:
                 'accuracy': 'good'
             }
         }
-        self.get_embedding_model('heavy')
-        self.get_embedding_model('medium')
+        self.get_langchain_embedding_model('heavy')
+        self.get_langchain_embedding_model('medium')
         
     def get_gpu_memory_usage(self) -> float:
         """Get current GPU memory usage as a percentage"""
@@ -132,6 +142,7 @@ class HybridMemoryManager:
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             info = pynvml.nvmlDeviceGetMemoryInfo(handle)
             return info.used / info.total
+
         except Exception as e:
             self.logger.warning(f"Failed to get GPU memory usage: {e}")
             return 0.0
@@ -150,33 +161,37 @@ class HybridMemoryManager:
         
         return model_type
     
-    def get_embedding_model(self, model_type: str = 'heavy') -> SentenceTransformer:
-        """Get or initialize the embedding model for the specified type"""
+    def get_langchain_embedding_model(self, model_type: str = 'heavy') -> HuggingFaceEmbeddings:
+        """Get or initialize the LangChain embedding model for the specified type"""
         if model_type not in self.embedding_models:
             model_config = self.model_configs[model_type]
-            self.logger.info(f"Initializing {model_type} model: {model_config['name']}")
+            self.logger.info(f"Initializing LangChain {model_type} model: {model_config['name']}")
             
             try:
-                if model_type == 'heavy':
-                    model = SentenceTransformer(
-                        model_config['name'], 
-                        trust_remote_code=True
-                    )
-                else:
-                    model = SentenceTransformer(model_config['name'])
+                device = "cuda" if self.gpu_available and not self.should_use_cpu_only() else "cpu"
+                
+                model = HuggingFaceEmbeddings(
+                    model_name=model_config['name'],
+                    model_kwargs={'device': device, 'trust_remote_code': True},
+                    encode_kwargs={'device': device, 'batch_size': self.max_batch_size}
+                )
                 
                 self.embedding_models[model_type] = model
-                self.logger.info(f"Successfully loaded {model_type} model")
+                self.logger.info(f"Successfully loaded LangChain {model_type} model on {device}")
                 
             except Exception as e:
-                self.logger.error(f"Failed to load {model_type} model: {e}")
+                self.logger.error(f"Failed to load LangChain {model_type} model: {e}")
                 if model_type != 'light':
                     self.logger.info("Falling back to light model")
-                    return self.get_embedding_model('light')
+                    return self.get_langchain_embedding_model('light')
                 else:
                     raise e
         
         return self.embedding_models[model_type]
+    
+    def get_embedding_model(self, model_type: str = 'heavy') -> HuggingFaceEmbeddings:
+        """Legacy method - now returns LangChain embedding model"""
+        return self.get_langchain_embedding_model(model_type)
     
     def clear_model_cache(self):
         """Clear all model caches to free memory (should only be called if memory is critically low)"""
@@ -239,18 +254,22 @@ class HybridMemoryManager:
             self.logger.warning("GPU memory critical, using CPU only for encoding")
             try:
                 model = self.get_embedding_model(model_type)
-                embeddings = model.encode(texts, convert_to_tensor=False, device='cpu')
+                embeddings = model.embed_documents(texts)
                 for i, chunk_id in enumerate(chunk_ids):
                     self.cpu_cache[chunk_id] = embeddings[i]
-                return embeddings
+                return np.array(embeddings)
             except Exception as e:
                 self.logger.error(f"CPU encoding failed: {e}")
-                self.logger.warning("Trying emergency model")
-                emergency_model = self.get_emergency_model()
-                embeddings = emergency_model.encode(texts, convert_to_tensor=False, device='cpu')
-                for i, chunk_id in enumerate(chunk_ids):
-                    self.cpu_cache[chunk_id] = embeddings[i]
-                return embeddings
+                self.logger.warning("Trying light model as fallback")
+                try:
+                    fallback_model = self.get_embedding_model('light')
+                    embeddings = fallback_model.embed_documents(texts)
+                    for i, chunk_id in enumerate(chunk_ids):
+                        self.cpu_cache[chunk_id] = embeddings[i]
+                    return np.array(embeddings)
+                except Exception as fallback_e:
+                    self.logger.error(f"Fallback model also failed: {fallback_e}")
+                    raise fallback_e
         
         current_model_type = model_type
         current_batch_size = len(texts)
@@ -265,7 +284,7 @@ class HybridMemoryManager:
                 
                 model = self.get_embedding_model(current_model_type)
                 
-                embeddings = model.encode(texts, convert_to_tensor=False, device='cuda')
+                embeddings = model.embed_documents(texts)
                 
                 for i, chunk_id in enumerate(chunk_ids):
                     self.gpu_cache[chunk_id] = embeddings[i]
@@ -276,7 +295,7 @@ class HybridMemoryManager:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
-                return embeddings
+                return np.array(embeddings)
                 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
@@ -298,8 +317,8 @@ class HybridMemoryManager:
                             current_model_type = 'light'
                             self.logger.info("Recovery 2: Switching to light model")
                         else:
-                            current_model_type = 'emergency'
-                            self.logger.info("Recovery 2: Switching to emergency model")
+                            current_model_type = 'light'
+                            self.logger.info("Recovery 2: Switching to light model")
                         continue
                     
                     elif recovery_attempt == 2:
@@ -312,7 +331,7 @@ class HybridMemoryManager:
                                 batch_ids = chunk_ids[i:i + max(1, current_batch_size // 2)]
                                 
                                 try:
-                                    batch_embeddings = model.encode(batch_texts, convert_to_tensor=False, device='cuda')
+                                    batch_embeddings = model.embed_documents(batch_texts)
                                     all_embeddings.append(batch_embeddings)
                                     
                                     for j, chunk_id in enumerate(batch_ids):
@@ -341,14 +360,14 @@ class HybridMemoryManager:
                             continue
                     
                     elif recovery_attempt == 3:
-                        self.logger.info("Recovery 4: Maximum cleanup and emergency model")
+                        self.logger.info("Recovery 4: Maximum cleanup and light model")
                         self.gpu_cache.clear()
                         self.cpu_cache.clear()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                         gc.collect()
                         
-                        current_model_type = 'emergency'
+                        current_model_type = 'light'
                         continue
                 
                 else:
@@ -362,18 +381,22 @@ class HybridMemoryManager:
         
         try:
             model = self.get_embedding_model(model_type)
-            embeddings = model.encode(texts, convert_to_tensor=False, device='cpu')
+            embeddings = model.embed_documents(texts)
             for i, chunk_id in enumerate(chunk_ids):
                 self.cpu_cache[chunk_id] = embeddings[i]
-            return embeddings
+            return np.array(embeddings)
         except Exception as cpu_e:
             self.logger.error(f"CPU fallback also failed: {cpu_e}")
-            self.logger.warning("Trying emergency model as last resort")
-            emergency_model = self.get_emergency_model()
-            embeddings = emergency_model.encode(texts, convert_to_tensor=False, device='cpu')
-            for i, chunk_id in enumerate(chunk_ids):
-                self.cpu_cache[chunk_id] = embeddings[i]
-            return embeddings
+            self.logger.warning("Trying light model as last resort")
+            try:
+                fallback_model = self.get_embedding_model('light')
+                embeddings = fallback_model.embed_documents(texts)
+                for i, chunk_id in enumerate(chunk_ids):
+                    self.cpu_cache[chunk_id] = embeddings[i]
+                return np.array(embeddings)
+            except Exception as fallback_e:
+                self.logger.error(f"All models failed: {fallback_e}")
+                raise fallback_e
     
     def get_embeddings_for_search(self, chunk_ids: List[str]) -> Tuple[np.ndarray, List[str]]:
         """Get embeddings for search, pulling from GPU/CPU as needed"""
@@ -478,18 +501,22 @@ class HybridMemoryManager:
                 self.logger.info(f"Memory critical, processing piece {i//piece_size + 1} on CPU")
                 try:
                     model = self.get_embedding_model(current_model_type)
-                    piece_embeddings = model.encode(piece_texts, convert_to_tensor=False, device='cpu')
+                    piece_embeddings = model.embed_documents(piece_texts)
                     for j, chunk_id in enumerate(piece_ids):
                         self.cpu_cache[chunk_id] = piece_embeddings[j]
                     all_embeddings.append(piece_embeddings)
                 except Exception as e:
                     self.logger.error(f"CPU encoding failed for piece {i//piece_size + 1}: {e}")
-                    self.logger.warning("Trying emergency model for this piece")
-                    emergency_model = self.get_emergency_model()
-                    piece_embeddings = emergency_model.encode(piece_texts, convert_to_tensor=False, device='cpu')
-                    for j, chunk_id in enumerate(piece_ids):
-                        self.cpu_cache[chunk_id] = piece_embeddings[j]
-                    all_embeddings.append(piece_embeddings)
+                    self.logger.warning("Trying light model for this piece")
+                    try:
+                        fallback_model = self.get_embedding_model('light')
+                        piece_embeddings = fallback_model.embed_documents(piece_texts)
+                        for j, chunk_id in enumerate(piece_ids):
+                            self.cpu_cache[chunk_id] = piece_embeddings[j]
+                        all_embeddings.append(piece_embeddings)
+                    except Exception as fallback_e:
+                        self.logger.error(f"Fallback model also failed for piece {i//piece_size + 1}: {fallback_e}")
+                        raise fallback_e
             else:
                 piece_embeddings = None
                 current_piece_model = current_model_type
@@ -504,7 +531,7 @@ class HybridMemoryManager:
                         
                         model = self.get_embedding_model(current_piece_model)
                         
-                        piece_embeddings = model.encode(piece_texts, convert_to_tensor=False, device='cuda')
+                        piece_embeddings = model.embed_documents(piece_texts)
                         
                         for j, chunk_id in enumerate(piece_ids):
                             self.gpu_cache[chunk_id] = piece_embeddings[j]
@@ -536,8 +563,8 @@ class HybridMemoryManager:
                                     current_piece_model = 'light'
                                     self.logger.info(f"Piece {i//piece_size + 1} Recovery 2: Switching to light model")
                                 else:
-                                    current_piece_model = 'emergency'
-                                    self.logger.info(f"Piece {i//piece_size + 1} Recovery 2: Switching to emergency model")
+                                    current_piece_model = 'light'
+                                    self.logger.info(f"Piece {i//piece_size + 1} Recovery 2: Switching to light model")
                                 continue
                             
                             elif recovery_attempt == 2:
@@ -550,7 +577,7 @@ class HybridMemoryManager:
                                         sub_ids = piece_ids[j:j + max(1, len(piece_texts) // 2)]
                                         
                                         try:
-                                            sub_embeddings = model.encode(sub_texts, convert_to_tensor=False, device='cuda')
+                                            sub_embeddings = model.embed_documents(sub_texts)
                                             sub_piece_embeddings.append(sub_embeddings)
                                             
                                             for k, chunk_id in enumerate(sub_ids):
@@ -580,13 +607,13 @@ class HybridMemoryManager:
                                     continue
                             
                             elif recovery_attempt == 3:
-                                self.logger.info(f"Piece {i//piece_size + 1} Recovery 4: Maximum cleanup and emergency model")
+                                self.logger.info(f"Piece {i//piece_size + 1} Recovery 4: Maximum cleanup and light model")
                                 self.gpu_cache.clear()
                                 if torch.cuda.is_available():
                                     torch.cuda.empty_cache()
                                 gc.collect()
                                 
-                                current_piece_model = 'emergency'
+                                current_piece_model = 'light'
                                 continue
                         
                         else:
@@ -601,16 +628,20 @@ class HybridMemoryManager:
                     
                     try:
                         model = self.get_embedding_model(current_model_type)
-                        piece_embeddings = model.encode(piece_texts, convert_to_tensor=False, device='cpu')
+                        piece_embeddings = model.embed_documents(piece_texts)
                         for j, chunk_id in enumerate(piece_ids):
                             self.cpu_cache[chunk_id] = piece_embeddings[j]
                     except Exception as cpu_e:
                         self.logger.error(f"CPU fallback also failed for piece {i//piece_size + 1}: {cpu_e}")
-                        self.logger.warning(f"Trying emergency model for piece {i//piece_size + 1}")
-                        emergency_model = self.get_emergency_model()
-                        piece_embeddings = emergency_model.encode(piece_texts, convert_to_tensor=False, device='cpu')
-                        for j, chunk_id in enumerate(piece_ids):
-                            self.cpu_cache[chunk_id] = piece_embeddings[j]
+                        self.logger.warning(f"Trying light model for piece {i//piece_size + 1}")
+                        try:
+                            fallback_model = self.get_embedding_model('light')
+                            piece_embeddings = fallback_model.embed_documents(piece_texts)
+                            for j, chunk_id in enumerate(piece_ids):
+                                self.cpu_cache[chunk_id] = piece_embeddings[j]
+                        except Exception as fallback_e:
+                            self.logger.error(f"All models failed for piece {i//piece_size + 1}: {fallback_e}")
+                            raise fallback_e
                 
                 all_embeddings.append(piece_embeddings)
             
@@ -631,6 +662,143 @@ class DocumentChunk:
     def __init__(self, text: str, metadata: Dict[str, Any] = None):
         self.text = text
         self.metadata = metadata or {}
+
+class LangChainDocumentProcessor:
+    """LangChain-based document processing with custom memory management"""
+    
+    def __init__(self, memory_manager: HybridMemoryManager):
+        self.memory_manager = memory_manager
+        self.logger = logging.getLogger(__name__)
+        
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=700,
+            chunk_overlap=100,
+            length_function=len,
+            separators=["\n\n", "\n", " ", ""]
+        )
+    
+    async def process_pdf_from_bytes(self, pdf_bytes: bytes, file_size: int) -> List[Document]:
+        """Process PDF bytes using LangChain with PyPDF2 fallback if needed"""
+        try:
+            self.logger.info(f"Processing PDF with LangChain (size: {file_size / 1024 / 1024:.1f}MB)")
+            
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
+                temp_file.write(pdf_bytes)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Try LangChain's normal processing first
+                self.logger.info("Attempting LangChain normal processing")
+                loader = PyPDFLoader(temp_file_path)
+                
+                documents = loader.load()
+                self.logger.info(f"Loaded {len(documents)} pages from PDF using LangChain")
+                
+                # Check if we got meaningful content
+                total_content = "".join([doc.page_content for doc in documents])
+                if not total_content.strip() or len(total_content.strip()) < 100:
+                    self.logger.warning("LangChain extracted minimal content, trying PyPDF2 fallback")
+                    return await self._fallback_to_pypdf2(pdf_bytes, file_size)
+                
+                chunks = self.text_splitter.split_documents(documents)
+                self.logger.info(f"Split into {len(chunks)} chunks using LangChain")
+                
+                for i, chunk in enumerate(chunks):
+                    chunk.metadata.update({
+                        'chunk_id': f"chunk_{i}",
+                        'file_size': file_size,
+                        'processed_at': datetime.utcnow().isoformat(),
+                        'processor': 'langchain'
+                    })
+                
+                return chunks
+                
+            except Exception as langchain_error:
+                self.logger.warning(f"LangChain processing failed: {langchain_error}")
+                self.logger.info("Falling back to PyPDF2 processing")
+                return await self._fallback_to_pypdf2(pdf_bytes, file_size)
+                
+            finally:
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+                    
+        except Exception as e:
+            self.logger.error(f"Error processing PDF: {e}")
+            raise e
+    
+    async def _fallback_to_pypdf2(self, pdf_bytes: bytes, file_size: int) -> List[Document]:
+        """Fallback to PyPDF2 processing if LangChain fails"""
+        try:
+            self.logger.info("Using PyPDF2 fallback for text extraction")
+            
+            pdf_file = io.BytesIO(pdf_bytes)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            
+            text = ""
+            total_pages = len(pdf_reader.pages)
+            self.logger.info(f"Processing PDF with {total_pages} pages using PyPDF2 fallback")
+            
+            for page_num, page in enumerate(pdf_reader.pages):
+                try:
+                    page_text = page.extract_text()
+                    if page_text and page_text.strip():
+                        text += page_text + "\n"
+                    
+                    if page_num % 10 == 0:
+                        self.logger.info(f"Processed {page_num + 1}/{total_pages} pages with PyPDF2")
+                        
+                except Exception as e:
+                    self.logger.warning(f"Failed to extract text from page {page_num}: {e}")
+                    continue
+            
+            if not text.strip():
+                raise Exception("PyPDF2 failed to extract any text from PDF")
+            
+            self.logger.info(f"PyPDF2 extracted {len(text)} characters of text")
+            
+            document = Document(
+                page_content=text,
+                metadata={
+                    'source': 'pypdf2_fallback',
+                    'file_size': file_size,
+                    'processed_at': datetime.utcnow().isoformat()
+                }
+            )
+            
+            # Split into chunks
+            chunks = self.text_splitter.split_documents([document])
+            self.logger.info(f"Split into {len(chunks)} chunks using PyPDF2 fallback")
+            
+            # Add metadata to chunks
+            for i, chunk in enumerate(chunks):
+                chunk.metadata.update({
+                    'chunk_id': f"pypdf2_chunk_{i}",
+                    'file_size': file_size,
+                    'processor': 'pypdf2_fallback',
+                    'processed_at': datetime.utcnow().isoformat()
+                })
+            
+            return chunks
+            
+        except Exception as e:
+            self.logger.error(f"Error in PyPDF2 fallback: {e}")
+            raise e
+    
+    async def process_pdf_from_url(self, url: str) -> Tuple[List[Document], int]:
+        """Process PDF from URL using LangChain with PyPDF2 fallback"""
+        try:
+            self.logger.info(f"Downloading and processing PDF from URL: {url}")
+            
+            pdf_bytes = await download_pdf(url)
+            file_size = len(pdf_bytes)
+            
+            documents = await self.process_pdf_from_bytes(pdf_bytes, file_size)
+            
+            return documents, file_size
+            
+        except Exception as e:
+            self.logger.error(f"Error processing PDF from URL: {e}")
+            raise e
 
 class DocumentCacheManager:
     """Manages caching of chunked documents to avoid reprocessing"""
@@ -661,14 +829,14 @@ class DocumentCacheManager:
         metadata_path = self._get_metadata_path(url)
         return cache_path.exists() and metadata_path.exists()
     
-    def save_chunks(self, url: str, chunks: List[DocumentChunk], model_type: str, file_size: int):
-        """Save chunked document to cache"""
+    def save_chunks(self, url: str, chunks: List[Document], model_type: str, file_size: int):
+        """Save chunked document to cache (LangChain Documents)"""
         try:
             cache_path = self._get_cache_path(url)
             metadata_path = self._get_metadata_path(url)
             
             chunk_data = {
-                'chunks': [{'text': chunk.text, 'metadata': chunk.metadata} for chunk in chunks],
+                'chunks': [{'page_content': chunk.page_content, 'metadata': chunk.metadata} for chunk in chunks],
                 'model_type': model_type,
                 'file_size': file_size,
                 'cached_at': datetime.utcnow().isoformat()
@@ -689,15 +857,53 @@ class DocumentCacheManager:
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
             
-            self.logger.info(f"Cached {len(chunks)} chunks for document: {url}")
+            self.logger.info(f"Cached {len(chunks)} LangChain chunks for document: {url}")
             return True
             
         except Exception as e:
             self.logger.error(f"Failed to save chunks to cache: {e}")
             return False
     
-    def load_chunks(self, url: str) -> Tuple[List[DocumentChunk], str, int]:
-        """Load chunked document from cache"""
+    def save_chunks_with_embeddings(self, url: str, chunks: List[Document], embeddings: np.ndarray, model_type: str, file_size: int):
+        """Save chunks and embeddings to cache"""
+        try:
+            doc_hash = self._get_document_hash(url)
+            
+            chunks_path = self.cache_dir / f"{doc_hash}_chunks_{model_type}.pkl"
+            chunk_data = {
+                'chunks': [{'page_content': chunk.page_content, 'metadata': chunk.metadata} for chunk in chunks],
+                'model_type': model_type,
+                'file_size': file_size,
+                'cached_at': datetime.utcnow().isoformat()
+            }
+            with open(chunks_path, 'wb') as f:
+                pickle.dump(chunk_data, f)
+            
+            embeddings_path = self.cache_dir / f"{doc_hash}_embeddings_{model_type}.npy"
+            np.save(embeddings_path, embeddings)
+            
+            metadata_path = self.cache_dir / f"{doc_hash}_metadata_{model_type}.json"
+            metadata = {
+                'url': url,
+                'model_type': model_type,
+                'file_size': file_size,
+                'chunk_count': len(chunks),
+                'embedding_shape': embeddings.shape,
+                'cached_at': datetime.utcnow().isoformat(),
+                'hash': doc_hash
+            }
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            self.logger.info(f"Cached {len(chunks)} chunks and embeddings for document: {url}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save chunks and embeddings to cache: {e}")
+            return False
+    
+    def load_chunks(self, url: str) -> Tuple[List[Document], str, int]:
+        """Load chunked document from cache (LangChain Documents)"""
         try:
             cache_path = self._get_cache_path(url)
             metadata_path = self._get_metadata_path(url)
@@ -710,17 +916,51 @@ class DocumentCacheManager:
             
             chunks = []
             for chunk_info in chunk_data['chunks']:
-                chunk = DocumentChunk(
-                    text=chunk_info['text'],
+                chunk = Document(
+                    page_content=chunk_info['page_content'],
                     metadata=chunk_info.get('metadata', {})
                 )
                 chunks.append(chunk)
             
-            self.logger.info(f"Loaded {len(chunks)} chunks from cache for document: {url}")
+            self.logger.info(f"Loaded {len(chunks)} LangChain chunks from cache for document: {url}")
             return chunks, chunk_data['model_type'], chunk_data['file_size']
             
         except Exception as e:
             self.logger.error(f"Failed to load chunks from cache: {e}")
+            raise e
+    
+    def load_chunks_with_embeddings(self, url: str) -> Tuple[List[Document], np.ndarray, str, int]:
+        """Load chunks and embeddings from cache"""
+        try:
+            doc_hash = self._get_document_hash(url)
+            
+            chunks_path = self.cache_dir / f"{doc_hash}_chunks_heavy.pkl"
+            embeddings_path = self.cache_dir / f"{doc_hash}_embeddings_heavy.npy"
+            metadata_path = self.cache_dir / f"{doc_hash}_metadata_heavy.json"
+            
+            if chunks_path.exists() and embeddings_path.exists() and metadata_path.exists():
+                with open(chunks_path, 'rb') as f:
+                    chunk_data = pickle.load(f)
+                
+                chunks = []
+                for chunk_info in chunk_data['chunks']:
+                    chunk = Document(
+                        page_content=chunk_info['page_content'],
+                        metadata=chunk_info.get('metadata', {})
+                    )
+                    chunks.append(chunk)
+                
+                embeddings = np.load(embeddings_path)
+                
+                self.logger.info(f"Loaded {len(chunks)} chunks and embeddings from new cache format for document: {url}")
+                return chunks, embeddings, chunk_data['model_type'], chunk_data['file_size']
+            
+            else:
+                chunks, model_type, file_size = self.load_chunks(url)
+                return chunks, None, model_type, file_size
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load chunks and embeddings from cache: {e}")
             raise e
     
     def get_cache_info(self, url: str) -> Optional[Dict]:
@@ -764,7 +1004,7 @@ class DocumentCacheManager:
             self.logger.error(f"Failed to clear cache: {e}")
     
     def get_cache_stats(self) -> Dict:
-        """Get cache statistics"""
+        """Get document cache statistics"""
         try:
             cache_files = list(self.cache_dir.glob("*.pkl"))
             metadata_files = list(self.cache_dir.glob("*_metadata.json"))
@@ -792,6 +1032,16 @@ try:
 except LookupError:
     nltk.download('punkt')
 
+try:
+    nltk.data.find('taggers/averaged_perceptron_tagger')
+except LookupError:
+    nltk.download('averaged_perceptron_tagger')
+
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
@@ -812,9 +1062,15 @@ class RoundRobinAPIKeyManager:
             ("API_KEY_SEVENTH", os.environ.get("API_KEY_SEVENTH")),
             ("API_KEY_EIGTH", os.environ.get("API_KEY_EIGTH")),
             ("API_KEY_NINTH", os.environ.get("API_KEY_NINTH")),
-            
+            ("API_KEY_NINTH", os.environ.get("API_KEY_TENTH")),
+            ("API_KEY_ELEVEN", os.environ.get("API_KEY_ELEVEN")),
+            ("API_KEY_TWELVE", os.environ.get("API_KEY_TWELVE")),
+            ("API_KEY_THIRTEEN", os.environ.get("API_KEY_THIRTEEN")),
+            ("API_KEY_FOURTEEN", os.environ.get("API_KEY_FOURTEEN")),
+            ("API_KEY_FIFTEEN", os.environ.get("API_KEY_FIFTEEN")),
+            # ("API_KEY_SIXTEEN", os.environ.get("API_KEY_SIXTEEN")),
+            # ("API_KEY_SEVENTEEN", os.environ.get("API_KEY_SEVENTEEN"))
         ]
-        
         self.api_keys = []
         self.key_names = []
         
@@ -895,8 +1151,285 @@ class HackRXRequest(BaseModel):
 
 class HackRXResponse(BaseModel):
     answers: List[str]
+    
+    def __init__(self, **data):
+        super().__init__(**data)
+        # Remove backslashes and clean JSON escaping from all answers
+        if 'answers' in data:
+            self.answers = [answer.replace('\\', '').replace('\\"', '"').replace('\\n', ' ').replace('\\t', ' ') for answer in data['answers']]
+
+class LocalStorageSearchEngine:
+    """Local storage search engine that saves/loads chunks and embeddings from files folder"""
+    
+    def __init__(self, memory_manager: HybridMemoryManager, model_type: str = 'heavy'):
+        self.memory_manager = memory_manager
+        self.model_type = model_type
+        self.request_id = str(uuid.uuid4())
+        self.logger = logging.getLogger(__name__)
+        
+        self.files_dir = Path("files")
+        self.files_dir.mkdir(exist_ok=True)
+        
+        self.chunks = []
+        self.chunk_ids = []
+        self.embeddings = None
+        self.document_hash = None
+        
+        self.logger.info(f"Initialized Local Storage search engine with {model_type} model")
+    
+    def _get_document_hash(self, documents: List[Document]) -> str:
+        """Generate hash for documents"""
+        content = "".join([doc.page_content for doc in documents])
+        return hashlib.md5(content.encode()).hexdigest()
+    
+    def _get_embeddings_path(self, document_hash: str) -> Path:
+        """Get path for embeddings file"""
+        return self.files_dir / f"{document_hash}_embeddings_{self.model_type}.npy"
+    
+    def _get_chunks_path(self, document_hash: str) -> Path:
+        """Get path for chunks file"""
+        return self.files_dir / f"{document_hash}_chunks_{self.model_type}.pkl"
+    
+    def _get_metadata_path(self, document_hash: str) -> Path:
+        """Get path for metadata file"""
+        return self.files_dir / f"{document_hash}_metadata_{self.model_type}.json"
+    
+    def _is_cached(self, document_hash: str) -> bool:
+        """Check if embeddings and chunks are cached"""
+        embeddings_path = self._get_embeddings_path(document_hash)
+        chunks_path = self._get_chunks_path(document_hash)
+        metadata_path = self._get_metadata_path(document_hash)
+        
+        return embeddings_path.exists() and chunks_path.exists() and metadata_path.exists()
+    
+    def add_documents(self, documents: List[Document]):
+        """Add documents to local storage with caching"""
+        try:
+            self.logger.info(f"Adding {len(documents)} documents to local storage")
+            
+            self.document_hash = self._get_document_hash(documents)
+            
+            if self._is_cached(self.document_hash):
+                self.logger.info(f"Loading cached embeddings and chunks for document hash: {self.document_hash}")
+                self._load_from_cache()
+                return
+            
+            self.logger.info("Creating embeddings for documents")
+            
+            document_chunks = []
+            for i, doc in enumerate(documents):
+                chunk = DocumentChunk(
+                    text=doc.page_content,
+                    metadata=doc.metadata
+                )
+                document_chunks.append(chunk)
+            
+            self.chunk_ids = [f"{self.request_id}_chunk_{i}" for i in range(len(document_chunks))]
+            self.chunks = document_chunks
+            
+            texts = [chunk.text for chunk in document_chunks]
+            self.embeddings = self.memory_manager.encode_texts_hybrid(texts, self.chunk_ids, self.model_type)
+            
+            self._save_to_cache()
+            
+            self.logger.info(f"Successfully processed and cached {len(documents)} documents")
+            
+        except Exception as e:
+            self.logger.error(f"Error adding documents to local storage: {e}")
+            raise e
+    
+    def _save_to_cache(self):
+        """Save embeddings and chunks to cache"""
+        try:
+            embeddings_path = self._get_embeddings_path(self.document_hash)
+            np.save(embeddings_path, self.embeddings)
+            
+            chunks_path = self._get_chunks_path(self.document_hash)
+            chunk_data = {
+                'chunks': [{'text': chunk.text, 'metadata': chunk.metadata} for chunk in self.chunks],
+                'chunk_ids': self.chunk_ids
+            }
+            with open(chunks_path, 'wb') as f:
+                pickle.dump(chunk_data, f)
+            
+            metadata_path = self._get_metadata_path(self.document_hash)
+            metadata = {
+                'document_hash': self.document_hash,
+                'model_type': self.model_type,
+                'chunk_count': len(self.chunks),
+                'embedding_shape': self.embeddings.shape,
+                'cached_at': datetime.utcnow().isoformat(),
+                'request_id': self.request_id
+            }
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            self.logger.info(f"Saved embeddings and chunks to cache: {self.document_hash}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving to cache: {e}")
+    
+    def _load_from_cache(self):
+        """Load embeddings and chunks from cache"""
+        try:
+            embeddings_path = self._get_embeddings_path(self.document_hash)
+            self.embeddings = np.load(embeddings_path)
+            
+            chunks_path = self._get_chunks_path(self.document_hash)
+            with open(chunks_path, 'rb') as f:
+                chunk_data = pickle.load(f)
+            
+            self.chunks = []
+            for chunk_info in chunk_data['chunks']:
+                chunk = DocumentChunk(
+                    text=chunk_info['text'],
+                    metadata=chunk_info.get('metadata', {})
+                )
+                self.chunks.append(chunk)
+            
+            self.chunk_ids = chunk_data['chunk_ids']
+            
+            self.logger.info(f"Loaded {len(self.chunks)} chunks and embeddings from cache")
+            
+        except Exception as e:
+            self.logger.error(f"Error loading from cache: {e}")
+            raise e
+    
+    def search(self, query: str, top_k: int = 5) -> List[Document]:
+        """Search for most relevant documents"""
+        if len(self.chunks) == 0:
+            self.logger.warning("No chunks available for search")
+            return []
+        
+        try:
+            query_embedding = self.memory_manager.encode_texts_hybrid([query], model_type=self.model_type)[0]
+            
+            similarities = cosine_similarity([query_embedding], self.embeddings)[0]
+            
+            top_indices = np.argsort(similarities)[::-1][:top_k]
+            
+            results = []
+            for idx in top_indices:
+                chunk = self.chunks[idx]
+                doc = Document(
+                    page_content=chunk.text,
+                    metadata=chunk.metadata
+                )
+                results.append(doc)
+            
+            self.logger.info(f"Found {len(results)} relevant documents for query: {query[:50]}...")
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Error during search: {e}")
+            return []
+    
+    def search_with_score(self, query: str, top_k: int = 5) -> List[Tuple[Document, float]]:
+        """Search for documents with similarity scores"""
+        if len(self.chunks) == 0:
+            self.logger.warning("No chunks available for search")
+            return []
+        
+        try:
+            query_embedding = self.memory_manager.encode_texts_hybrid([query], model_type=self.model_type)[0]
+            
+            similarities = cosine_similarity([query_embedding], self.embeddings)[0]
+            
+            top_indices = np.argsort(similarities)[::-1][:top_k]
+            
+            results = []
+            for idx in top_indices:
+                chunk = self.chunks[idx]
+                doc = Document(
+                    page_content=chunk.text,
+                    metadata=chunk.metadata
+                )
+                results.append((doc, similarities[idx]))
+            
+            self.logger.info(f"Found {len(results)} relevant documents with scores for query: {query[:50]}...")
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Error during search with scores: {e}")
+            return []
+    
+    def hybrid_search(self, query: str, top_k: int = 10) -> List[Document]:
+        """Hybrid search combining semantic similarity with diversity"""
+        if len(self.chunks) == 0:
+            return []
+        
+        try:
+            semantic_results = self.search(query, top_k)
+            
+            query_embedding = self.memory_manager.encode_texts_hybrid([query], model_type=self.model_type)[0]
+            similarities = cosine_similarity([query_embedding], self.embeddings)[0]
+            
+            selected_indices = set()
+            results = []
+            
+            for doc in semantic_results:
+                for i, chunk in enumerate(self.chunks):
+                    if chunk.text == doc.page_content:
+                        selected_indices.add(i)
+                        break
+                results.append(doc)
+            
+            remaining_indices = [i for i in range(len(self.chunks)) if i not in selected_indices]
+            if remaining_indices:
+                remaining_similarities = similarities[remaining_indices]
+                diverse_indices = np.argsort(remaining_similarities)[::-1][:top_k//2]
+                
+                for idx in diverse_indices:
+                    original_idx = remaining_indices[idx]
+                    chunk = self.chunks[original_idx]
+                    doc = Document(
+                        page_content=chunk.text,
+                        metadata=chunk.metadata
+                    )
+                    results.append(doc)
+                    
+                    if len(results) >= top_k:
+                        break
+            
+            seen_contents = set()
+            unique_results = []
+            for doc in results:
+                if doc.page_content not in seen_contents:
+                    unique_results.append(doc)
+                    seen_contents.add(doc.page_content)
+                    
+                    if len(unique_results) >= top_k:
+                        break
+            
+            self.logger.info(f"Hybrid search found {len(unique_results)} unique documents")
+            return unique_results
+            
+        except Exception as e:
+            self.logger.error(f"Error during hybrid search: {e}")
+            return self.search(query, top_k) 
+    
+    def clear_memory(self):
+        """Clear in-memory data"""
+        try:
+            self.chunks.clear()
+            self.chunk_ids.clear()
+            self.embeddings = None
+            self.document_hash = None
+            
+            self.logger.info(f"Cleared memory for local storage search engine (request_id: {self.request_id})")
+            
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            self.logger.error(f"Error clearing memory: {e}")
+
+class LangChainSearchEngine(LocalStorageSearchEngine):
+    """Backward compatibility wrapper"""
+    pass
 
 class SemanticSearchEngine:
+    """Legacy search engine for backward compatibility"""
     def __init__(self, model_type: str = 'heavy'):
         self.chunks = []
         self.chunk_ids = []  
@@ -1235,7 +1768,7 @@ async def generate_answer(question: str, relevant_chunks: List[DocumentChunk], m
                 temperature=0.1
             )
             elapsed = time.time() - start_time
-            answer = response.choices[0].message.content.strip()
+            answer = response.choices[0].message.content.strip().replace('\\', '').replace('\\"', '"').replace('\\n', ' ').replace('\\t', ' ')
             no_info_indicators = [
                 "not available", "not found", "not mentioned", "not specified",
                 "not provided", "not stated", "not included", "not covered",
@@ -1291,31 +1824,30 @@ Instruction:
             max_tokens=150,
             temperature=0.3
         )
-        return response.choices[0].message.content.strip()
+        return response.choices[0].message.content.strip().replace('\\', '').replace('\\"', '"').replace('\\n', ' ').replace('\\t', ' ')
 
     except Exception as e:
         logger.warning(f"Summarization failed: {str(e)}")
         return raw_answer 
 
-async def generate_answer_with_retry(question: str, search_engine, start_k: int = 5) -> str:
-    """Generate answer with hybrid search and smart retry logic, with API key rotation on error"""
+async def generate_answer_with_langchain_retry(question: str, search_engine: LangChainSearchEngine, start_k: int = 5) -> str:
+    """Generate answer with LangChain search engine and smart retry logic"""
     max_api_retries = len(api_key_manager.api_keys)
-    max_attempts = 2  
-    used_chunks = set()
+    max_attempts = 3
+    used_documents = set()
+    
     logger.info("Starting with hybrid search for better initial results")
-    hybrid_chunks = search_engine.hybrid_search(question, top_k=start_k)
-    if hybrid_chunks:
-        for chunk in hybrid_chunks:
-            chunk_idx = search_engine.chunks.index(chunk)
-            used_chunks.add(chunk_idx)
-        logger.info(f"Hybrid search found {len(hybrid_chunks)} relevant chunks")
-        answer, success = await generate_answer(question, hybrid_chunks, max_api_retries=max_api_retries)
+    
+    hybrid_docs = search_engine.hybrid_search(question, top_k=start_k)
+    if hybrid_docs:
+        logger.info(f"Hybrid search found {len(hybrid_docs)} relevant documents")
+        answer, success = await generate_answer_from_langchain_docs(question, hybrid_docs, max_api_retries=max_api_retries)
         if answer == "TPM_LIMIT_HIT":
             logger.info("TPM limit hit on hybrid search, switching API key and retrying immediately...")
             continue_retry = True
             retry_count = 0
             while continue_retry and retry_count < max_api_retries:
-                answer, success = await generate_answer(question, hybrid_chunks, max_api_retries=max_api_retries)
+                answer, success = await generate_answer_from_langchain_docs(question, hybrid_docs, max_api_retries=max_api_retries)
                 if answer != "TPM_LIMIT_HIT":
                     continue_retry = False
                 retry_count += 1
@@ -1323,54 +1855,133 @@ async def generate_answer_with_retry(question: str, search_engine, start_k: int 
             logger.info("Successfully generated answer with hybrid search")
             summarized_answer = await summarize_answer(answer, question)
             return summarized_answer
+    
     for attempt in range(max_attempts):
-        logger.info(f"Progressive attempt {attempt + 1}: Searching for new chunks")
-        new_chunks, current_k, max_k = search_engine.search_progressive(
-            question, start_k=3, max_k=None, used_chunks=used_chunks
-        )
-        if not new_chunks:
-            logger.info("No more new chunks available to search")
+        logger.info(f"Progressive attempt {attempt + 1}: Searching for new documents")
+        
+        if attempt == 0:
+            new_docs = search_engine.search(question, top_k=start_k)
+        elif attempt == 1:
+            scored_docs = search_engine.search_with_score(question, top_k=start_k*2)
+            new_docs = [doc for doc, score in scored_docs if score > 0.5]
+        else:
+            new_docs = search_engine.hybrid_search(question, top_k=start_k)
+        
+        if not new_docs:
+            logger.info("No more new documents available to search")
             break
-        logger.info(f"Found {len(new_chunks)} new relevant chunks for attempt {attempt + 1}")
-        answer, success = await generate_answer(question, new_chunks, max_api_retries=max_api_retries)
+        
+        unique_docs = []
+        for doc in new_docs:
+            if doc.page_content not in used_documents:
+                unique_docs.append(doc)
+                used_documents.add(doc.page_content)
+        
+        if not unique_docs:
+            logger.info("No unique documents found in this attempt")
+            continue
+        
+        logger.info(f"Found {len(unique_docs)} new unique documents for attempt {attempt + 1}")
+        answer, success = await generate_answer_from_langchain_docs(question, unique_docs, max_api_retries=max_api_retries)
+        
         if answer == "TPM_LIMIT_HIT":
             logger.info(f"TPM limit hit on attempt {attempt + 1}, switching API key and retrying immediately...")
             continue_retry = True
             retry_count = 0
             while continue_retry and retry_count < max_api_retries:
-                answer, success = await generate_answer(question, new_chunks, max_api_retries=max_api_retries)
+                answer, success = await generate_answer_from_langchain_docs(question, unique_docs, max_api_retries=max_api_retries)
                 if answer != "TPM_LIMIT_HIT":
                     continue_retry = False
                 retry_count += 1
+        
         if success:
             logger.info(f"Successfully generated answer on attempt {attempt + 1}")
             summarized_answer = await summarize_answer(answer, question)
             return summarized_answer
+        
         logger.info(f"No useful answer found on attempt {attempt + 1}")
         await asyncio.sleep(0.1)
-    logger.info("Trying 4th attempt: comprehensive search with all remaining chunks")
-    remaining_chunks = []
-    for i, chunk in enumerate(search_engine.chunks):
-        if i not in used_chunks:
-            remaining_chunks.append(chunk)
-    if remaining_chunks:
-        logger.info(f"4th attempt: searching with {len(remaining_chunks)} remaining chunks")
-        answer, success = await generate_answer(question, remaining_chunks, max_api_retries=max_api_retries)
-        if answer == "TPM_LIMIT_HIT":
-            logger.info("TPM limit hit on 4th attempt, switching API key and retrying immediately...")
-            continue_retry = True
-            retry_count = 0
-            while continue_retry and retry_count < max_api_retries:
-                answer, success = await generate_answer(question, remaining_chunks, max_api_retries=max_api_retries)
-                if answer != "TPM_LIMIT_HIT":
-                    continue_retry = False
-                retry_count += 1
-        if success:
-            logger.info("Successfully generated answer on 4th attempt")
-            summarized_answer = await summarize_answer(answer, question)
-            return summarized_answer
-    logger.info("No answer found after 4 attempts")
+    
+    logger.info("No answer found after all attempts")
     return "This information is not available in the document"
+
+async def generate_answer_from_langchain_docs(question: str, documents: List[Document], max_api_retries: int = 4) -> Tuple[str, bool]:
+    """Generate answer using LangChain documents with custom LLM integration"""
+    attempt = 0
+    while attempt < max_api_retries:
+        try:
+            context = "\n\n".join([doc.page_content for doc in documents])
+            
+            encoding = tiktoken.get_encoding("cl100k_base") 
+            context_tokens = encoding.encode(context)
+            max_context_tokens = 4900
+            if len(context_tokens) > max_context_tokens:
+                context_tokens = context_tokens[:max_context_tokens]
+                context = encoding.decode(context_tokens)
+            
+            prompt = f"""Based on the following document content, provide a direct and complete answer to the question in 1-4 sentence depending on the question and prioritize completeness over brevity.
+
+Document Content:
+{context}
+
+Question: {question}
+
+Instructions:
+- Answer in 2-4 sentences only and no extra legal texts, but make it short and complete, don't remove the necessary information even in slightest
+- Be direct and to the point and get all the details
+- No bullet points, no lists, no explanations
+- If information is not available, simply say "This information is not available in the document"
+- Use specific details from the document when available"""
+
+            start_time = time.time()
+            response = await asyncio.to_thread(
+                api_key_manager.create_client().chat.completions.create,
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that answers questions based on document content. Always provide accurate, direct answers based on the provided context."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=400,
+                temperature=0.1
+            )
+            elapsed = time.time() - start_time
+            answer = response.choices[0].message.content.strip().replace('\\', '').replace('\\"', '"').replace('\\n', ' ').replace('\\t', ' ')
+            
+            no_info_indicators = [
+                "not available", "not found", "not mentioned", "not specified",
+                "not provided", "not stated", "not included", "not covered",
+                "no information", "no details", "no mention", "no data",
+                "cannot find", "unable to find", "does not contain"
+            ]
+            answer_lower = answer.lower()
+            if any(indicator in answer_lower for indicator in no_info_indicators):
+                return answer, False 
+            return answer, True 
+            
+        except Exception as e:
+            logger.error(f"Error generating answer (attempt {attempt+1}): {str(e)}")
+            err_str = str(e).lower()
+            if ("6000" in err_str or "tpm" in err_str or "rate limit" in err_str or "429" in err_str) or (('too many request' in err_str or 'rate limit' in err_str or '429' in err_str) and 'timeout' in err_str):
+                attempt += 1
+                logger.info(f"Switching API key and retrying (attempt {attempt+1})...")
+                continue
+            if hasattr(e, 'response') and hasattr(e.response, 'status_code') and e.response.status_code == 429:
+                if elapsed > 4:
+                    attempt += 1
+                    logger.info(f"429 error after {elapsed:.2f}s, switching API key and retrying (attempt {attempt+1})...")
+                    continue
+            if "tpm_limit_hit" in err_str:
+                attempt += 1
+                logger.info(f"TPM limit hit, switching API key and retrying (attempt {attempt+1})...")
+                continue
+            if attempt == max_api_retries - 1:
+                return f"Error generating answer: {str(e)}", False
+            attempt += 1
+    return "TPM_LIMIT_HIT", False
+
+async def generate_answer_with_retry(question: str, search_engine, start_k: int = 5) -> str:
+    """Legacy function for backward compatibility"""
+    return await generate_answer_with_langchain_retry(question, search_engine, start_k)
 
 @api_router.get("/")
 async def root():
@@ -1580,23 +2191,61 @@ async def get_api_key_status():
         raise HTTPException(status_code=500, detail=f"Failed to get API key status: {str(e)}")
 
 async def process_hackrx_request(request: HackRXRequest):
-    """Internal function to process HackRX request with caching"""
+    """Internal function to process HackRX request with LangChain processing and PyPDF2 fallback"""
     logger.info(f"Processing request with document: {request.documents}")
     logger.info(f"Questions: {len(request.questions)}")
     
-    if document_cache_manager.is_cached(request.documents):
-        logger.info(f"Document found in cache: {request.documents}")
+    doc_processor = LangChainDocumentProcessor(memory_manager)
+    
+    doc_hash = document_cache_manager._get_document_hash(request.documents)
+    embeddings_path = Path("files") / f"{doc_hash}_embeddings_heavy.npy"
+    chunks_path = Path("files") / f"{doc_hash}_chunks_heavy.pkl"
+    
+    if embeddings_path.exists() and chunks_path.exists():
+        logger.info(f"Document found in local storage cache: {request.documents}")
         try:
-            chunks, model_type, file_size = document_cache_manager.load_chunks(request.documents)
-            logger.info(f"Loaded {len(chunks)} chunks from cache")
+            documents, embeddings, model_type, file_size = document_cache_manager.load_chunks_with_embeddings(request.documents)
+            logger.info(f"Loaded {len(documents)} documents and embeddings from local storage cache")
             
-            search_engine = SemanticSearchEngine(model_type=model_type)
-            search_engine.add_chunks(chunks)
+            search_engine = LangChainSearchEngine(memory_manager, model_type=model_type)
+            search_engine.document_hash = doc_hash
+            search_engine.chunks = [DocumentChunk(text=doc.page_content, metadata=doc.metadata) for doc in documents]
+            search_engine.chunk_ids = [f"{search_engine.request_id}_chunk_{i}" for i in range(len(documents))]
+            search_engine.embeddings = embeddings
+            
+            logger.info(f"Successfully loaded from local storage cache")
+            
+        except Exception as cache_error:
+            logger.error(f"Error loading from local storage cache: {cache_error}")
+            logger.info("Falling back to old cache format")
+            
+            if document_cache_manager.is_cached(request.documents):
+                try:
+                    documents, model_type, file_size = document_cache_manager.load_chunks(request.documents)
+                    logger.info(f"Loaded {len(documents)} LangChain documents from old cache format")
+                    
+                    search_engine = LangChainSearchEngine(memory_manager, model_type=model_type)
+                    search_engine.add_documents(documents)
+                    
+                except Exception as old_cache_error:
+                    logger.error(f"Error loading from old cache: {old_cache_error}")
+                    logger.info("Falling back to normal processing")
+            else:
+                logger.info("Document not found in any cache, processing normally")
+    
+    elif document_cache_manager.is_cached(request.documents):
+        logger.info(f"Document found in old cache format: {request.documents}")
+        try:
+            documents, model_type, file_size = document_cache_manager.load_chunks(request.documents)
+            logger.info(f"Loaded {len(documents)} LangChain documents from old cache")
+            
+            search_engine = LangChainSearchEngine(memory_manager, model_type=model_type)
+            search_engine.add_documents(documents)
             
             async def answer_one(idx, question):
                 logger.info(f"Processing question {idx+1}/{len(request.questions)}: {question}")
                 normalized_question = normalize_question(question)
-                answer = await generate_answer_with_retry(question, search_engine, start_k=5)
+                answer = await generate_answer_with_langchain_retry(question, search_engine, start_k=5)
                 logger.info(f"Generated answer: {answer[:100]}...")
                 return answer
 
@@ -1622,29 +2271,60 @@ async def process_hackrx_request(request: HackRXRequest):
     
     pdf_bytes = await download_pdf(request.documents)
     file_size = len(pdf_bytes)
-    logger.info(f"PDF downloaded successfully. File size: {file_size / 1024 / 1024:.1f}MB")
+    logger.info(f"Downloaded PDF. File size: {file_size / 1024 / 1024:.1f}MB")
     
-    use_piece_processing = memory_manager.should_use_piece_processing(file_size, 0)
+    # Use LangChainDocumentProcessor with PyPDF2 fallback
+    documents, file_size = await doc_processor.process_pdf_from_url(request.documents)
+    logger.info(f"PDF processed with LangChain (with PyPDF2 fallback if needed). File size: {file_size / 1024 / 1024:.1f}MB, {len(documents)} documents")
     
-    if use_piece_processing:
-        logger.info("Using piece-by-piece processing for large document")
-        response = await process_large_document_piece_by_piece(request, pdf_bytes, file_size)
+    model_type = memory_manager.select_model_for_pdf_size(file_size)
+    
+    search_engine = LangChainSearchEngine(memory_manager, model_type=model_type)
+    search_engine.add_documents(documents)
+    
+    cache_success = document_cache_manager.save_chunks(
+        request.documents, documents, model_type, file_size
+    )
+    if cache_success:
+        logger.info(f"Successfully cached {len(documents)} LangChain documents for future requests")
     else:
-        logger.info("Using standard processing for document")
-        response = await process_document_standard(request, pdf_bytes, file_size)
+        logger.warning("Failed to cache documents, but continuing with processing")
+    
+    answers = []
+    for i, question in enumerate(request.questions):
+        logger.info(f"Processing question {i+1}/{len(request.questions)}: {question}")
+        
+        normalized_question = normalize_question(question)
+        answer = await generate_answer_with_langchain_retry(question, search_engine, start_k=5)
+        answers.append(answer)
+        logger.info(f"Generated answer: {answer[:100]}...")
+        
+        if i % 3 == 0:
+            memory_manager.cleanup_memory()
+            logger.info("Periodic memory cleanup performed")
     
     logger.info("All questions processed successfully")
-    logger.info(f"Returning response with {len(response.answers)} answers")
+    logger.info(f"Returning response with {len(answers)} answers")
     
     try:
-        final_response = HackRXResponse(answers=response.answers)
+        final_response = HackRXResponse(answers=answers)
         logger.info("Response object created successfully")
         logger.info(f"Response content: {final_response.answers}")
-        asyncio.create_task(asyncio.to_thread(memory_manager.cleanup_memory))
+        
+        def cleanup():
+            try:
+                memory_manager.cleanup_memory()
+                search_engine.clear_memory()
+                memory_manager.clear_model_cache()
+                logger.info("Cleanup completed")
+            except Exception as cleanup_error:
+                logger.warning(f"Cleanup error (non-critical): {cleanup_error}")
+        asyncio.create_task(asyncio.to_thread(cleanup))
+        
         return final_response
     except Exception as response_error:
         logger.error(f"Error creating response: {response_error}")
-        return HackRXResponse(answers=response.answers)
+        return HackRXResponse(answers=answers)
 
 @api_router.post("/hackrx/run", response_model=HackRXResponse)
 async def hackrx_run(request: HackRXRequest):
@@ -1902,16 +2582,74 @@ async def process_simple_request(request: HackRXRequest):
 
 @api_router.post("/hackrx/run/simple", response_model=HackRXResponse)
 async def hackrx_run_simple(request: HackRXRequest):
-    """Simple endpoint with request queue system"""
-    request_id = str(uuid.uuid4())
-    logger.info(f"📥 Received simple request {request_id}")
-    
+    """Simple endpoint for HackRX requests with fast PDF processing"""
     try:
-        result = await request_queue.process_request(request_id, process_simple_request, request)
-        return result
+        return await request_queue.process_request(
+            str(uuid.uuid4()),
+            process_simple_request,
+            request
+        )
     except Exception as e:
-        logger.error(f"Error in hackrx_run_simple: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Error in hackrx_run_simple: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process request: {str(e)}")
+
+@api_router.post("/hackrx/run/fast", response_model=HackRXResponse)
+async def hackrx_run_fast(request: HackRXRequest):
+    """Fast endpoint for HackRX requests using LangChain with PyPDF2 fallback"""
+    try:
+        logger.info(f"Processing fast request with document: {request.documents}")
+        
+        doc_processor = LangChainDocumentProcessor(memory_manager)
+        
+        pdf_bytes = await download_pdf(request.documents)
+        file_size = len(pdf_bytes)
+        logger.info(f"Downloaded PDF for fast processing. File size: {file_size / 1024 / 1024:.1f}MB")
+        
+        documents, file_size = await doc_processor.process_pdf_from_url(request.documents)
+        logger.info(f"LangChain processing completed with PyPDF2 fallback if needed. {len(documents)} documents created")
+        
+        model_type = memory_manager.select_model_for_pdf_size(file_size)
+        
+        search_engine = LangChainSearchEngine(memory_manager, model_type=model_type)
+        search_engine.add_documents(documents)
+        
+        cache_success = document_cache_manager.save_chunks(
+            request.documents, documents, model_type, file_size
+        )
+        if cache_success:
+            logger.info(f"Successfully cached {len(documents)} documents for future requests")
+        
+        answers = []
+        for i, question in enumerate(request.questions):
+            logger.info(f"Processing question {i+1}/{len(request.questions)}: {question}")
+            
+            normalized_question = normalize_question(question)
+            answer = await generate_answer_with_langchain_retry(question, search_engine, start_k=5)
+            answers.append(answer)
+            logger.info(f"Generated answer: {answer[:100]}...")
+            
+            if i % 3 == 0:
+                memory_manager.cleanup_memory()
+                logger.info("Periodic memory cleanup performed")
+        
+        logger.info("All questions processed successfully with LangChain method")
+        
+        def cleanup():
+            try:
+                memory_manager.cleanup_memory()
+                search_engine.clear_memory()
+                memory_manager.clear_model_cache()
+                logger.info("Fast processing cleanup completed")
+            except Exception as cleanup_error:
+                logger.warning(f"Fast processing cleanup error: {cleanup_error}")
+        
+        asyncio.create_task(asyncio.to_thread(cleanup))
+        
+        return HackRXResponse(answers=answers)
+        
+    except Exception as e:
+        logger.error(f"Error in LangChain processing: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process request with LangChain method: {str(e)}")
 
 app.include_router(api_router)
 

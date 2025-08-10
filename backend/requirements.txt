@@ -37,3 +37,15 @@ einops
 pynvml
 nvidia-ml-py
 psutil
+# LangChain for document processing and embeddings
+langchain>=0.1.0
+langchain-text-splitters>=0.0.1
+langchain-community>=0.0.10
+langchain-core>=0.1.0
+langchain-huggingface>=0.0.1
+faiss-cpu>=1.7.4
+unstructured>=0.10.0
+unstructured[pdf]>=0.10.0
+torch 
+torchvision 
+torchaudio

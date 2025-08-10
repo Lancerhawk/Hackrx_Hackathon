@@ -1,0 +1,11 @@
+{
+  "document_hash": "7f51ff416902d65b0d12acba86e3fe40",
+  "model_type": "heavy",
+  "chunk_count": 214,
+  "embedding_shape": [
+    214,
+    768
+  ],
+  "cached_at": "2025-08-08T12:15:59.419813",
+  "request_id": "ca8afc65-00fc-49b7-8f42-8b18d73be6b5"
+}
