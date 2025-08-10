@@ -93,7 +93,7 @@ class HybridMemoryManager:
         self.embedding_models = {}  
         self.logger = logging.getLogger(__name__)
         
-        self.max_chunk_size = 700  
+        self.max_chunk_size = 500  
         self.max_batch_size = 64   
         self.memory_safety_margin = 0.1
         
@@ -102,15 +102,13 @@ class HybridMemoryManager:
         
         self.model_configs = {
             'heavy': {
-                # 'name': 'nomic-ai/nomic-embed-text-v1',
-                'name': 'all-MiniLM-L6-v2',
+                'name': 'nomic-ai/nomic-embed-text-v1',
                 'dimension': 768,
                 'speed': 'slow',
                 'accuracy': 'high'
             },
             'medium': {
-                # 'name': 'all-mpnet-base-v2',
-                'name': 'all-MiniLM-L6-v2',
+                'name': 'all-mpnet-base-v2',
                 'dimension': 768,
                 'speed': 'medium',
                 'accuracy': 'high'
@@ -806,20 +804,20 @@ class RoundRobinAPIKeyManager:
     def __init__(self):
         all_keys = [
             ("API_KEY", os.environ.get("API_KEY")),
-            ("API_KEY_SECOND", os.environ.get("API_KEY_SECOND")),
-            ("API_KEY_THIRD", os.environ.get("API_KEY_THIRD")),
-            ("API_KEY_FOURTH", os.environ.get("API_KEY_FOURTH")),
-            ("API_KEY_FIFTH", os.environ.get("API_KEY_FIFTH")),
-            ("API_KEY_SIXTH", os.environ.get("API_KEY_SIXTH")),
-            ("API_KEY_SEVENTH", os.environ.get("API_KEY_SEVENTH")),
-            ("API_KEY_EIGTH", os.environ.get("API_KEY_EIGTH")),
-            ("API_KEY_NINTH", os.environ.get("API_KEY_NINTH")),
-            ("API_KEY_TENTH", os.environ.get("API_KEY_TENTH")),
-            ("API_KEY_ELEVEN", os.environ.get("API_KEY_ELEVEN")),
-            ("API_KEY_TWELVE", os.environ.get("API_KEY_TWELVE")),
-            ("API_KEY_THIRTEEN", os.environ.get("API_KEY_THIRTEEN")),
-            ("API_KEY_FOURTEEN", os.environ.get("API_KEY_FOURTEEN")),
-            ("API_KEY_FIFTEEN", os.environ.get("API_KEY_FIFTEEN"))
+            # ("API_KEY_SECOND", os.environ.get("API_KEY_SECOND")),
+            # ("API_KEY_THIRD", os.environ.get("API_KEY_THIRD")),
+            # ("API_KEY_FOURTH", os.environ.get("API_KEY_FOURTH")),
+            # ("API_KEY_FIFTH", os.environ.get("API_KEY_FIFTH")),
+            # ("API_KEY_SIXTH", os.environ.get("API_KEY_SIXTH")),
+            # ("API_KEY_SEVENTH", os.environ.get("API_KEY_SEVENTH")),
+            # ("API_KEY_EIGTH", os.environ.get("API_KEY_EIGTH")),
+            # ("API_KEY_NINTH", os.environ.get("API_KEY_NINTH")),
+            # ("API_KEY_TENTH", os.environ.get("API_KEY_TENTH")),
+            # ("API_KEY_ELEVEN", os.environ.get("API_KEY_ELEVEN")),
+            # ("API_KEY_TWELVE", os.environ.get("API_KEY_TWELVE")),
+            # ("API_KEY_THIRTEEN", os.environ.get("API_KEY_THIRTEEN")),
+            # ("API_KEY_FOURTEEN", os.environ.get("API_KEY_FOURTEEN")),
+            # ("API_KEY_FIFTEEN", os.environ.get("API_KEY_FIFTEEN"))
         ]
         
         self.api_keys = []
@@ -1143,7 +1141,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to extract text from PDF: {str(e)}")
 
-def chunk_text_piece_by_piece(text: str, chunk_size: int = 700, overlap: int = 100) -> Generator[List[str], None, None]:
+def chunk_text_piece_by_piece(text: str, chunk_size: int = 500, overlap: int = 100) -> Generator[List[str], None, None]:
     """Split text into very small chunks for piece-by-piece processing"""
     text = re.sub(r'\n+', '\n', text)
     text = re.sub(r'\s+', ' ', text)
@@ -1225,7 +1223,7 @@ async def generate_answer(question: str, relevant_chunks: List[DocumentChunk], m
             context = "\n\n".join([chunk.text for chunk in relevant_chunks])
             encoding = tiktoken.get_encoding("cl100k_base") 
             context_tokens = encoding.encode(context)
-            max_context_tokens = 4900
+            max_context_tokens = 3000
             if len(context_tokens) > max_context_tokens:
                 context_tokens = context_tokens[:max_context_tokens]
                 context = encoding.decode(context_tokens)
@@ -1238,7 +1236,7 @@ async def generate_answer(question: str, relevant_chunks: List[DocumentChunk], m
                     {"role": "system", "content": "You are a helpful assistant that answers questions based on document content. Always provide accurate, direct answers based on the provided context."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=400,
+                max_tokens=300,
                 temperature=0.1
             )
             elapsed = time.time() - start_time
